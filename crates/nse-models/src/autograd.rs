@@ -455,6 +455,182 @@ fn residual_from_cache_last(cache: &ForwardCache) -> Vec<f32> {
     }
 }
 
+/// Local (per-block) backward used by the Forward-Forward trainer.
+///
+/// Given `dy` = gradient of a scalar objective `O` w.r.t. block `layer`'s
+/// output `y = x_after_ffn` (`[seq, dim]`), accumulate `scale * dO/dW` into
+/// `grads` for **only that block's weights** (qkv, attn_out, ff_up, ff_down,
+/// ln1_gain, ln2_gain). No gradient flows to earlier blocks or to the
+/// head/embedding — the block's input is treated as frozen. This is the
+/// local, no-global-backprop primitive that lets each transformer block be
+/// trained by a local goodness objective (Hinton's Forward-Forward): the
+/// caller supplies `dy = dG/dy` for a local goodness `G`, and the block's
+/// weights are updated using only the local computation graph.
+pub fn block_backward_local(
+    lm: &ToyLm,
+    cache: &ForwardCache,
+    layer: usize,
+    dy: &[f32],
+    scale: f32,
+    grads: &mut ToyLmGrads,
+) {
+    let c = &lm.config;
+    let seq = cache.tokens.len();
+    let d = c.dim;
+    let nh = c.num_heads;
+    let hd = d / nh;
+    let lc = &cache.layers[layer];
+    let qkv_w = &lm.weights.qkv[layer];
+    let attn_out_w = &lm.weights.attn_out[layer];
+    let ff_up_w = &lm.weights.ff_up[layer];
+    let ff_down_w = &lm.weights.ff_down[layer];
+
+    // dx = dO/dy (block output). FFN residual: y = x' + ff_down_out.
+    let d_ff_down_out = dy;
+
+    // dWff_down[i,j] += sum_t ff_up_act[t,j] * d_ff_down_out[t,i]
+    for t in 0..seq {
+        for i in 0..d {
+            let dl = d_ff_down_out[t * d + i] * scale;
+            if dl == 0.0 {
+                continue;
+            }
+            for j in 0..c.ff_dim {
+                grads.ff_down[layer].data[i * c.ff_dim + j] +=
+                    dl * lc.ff_up_act[t * c.ff_dim + j];
+            }
+        }
+    }
+    // d_ff_up_act = d_ff_down_out @ Wff_down  → [seq, ff_dim]
+    let mut d_ff_up_act = vec![0.0f32; seq * c.ff_dim];
+    for t in 0..seq {
+        for j in 0..c.ff_dim {
+            let mut s = 0.0;
+            for i in 0..d {
+                s += d_ff_down_out[t * d + i] * ff_down_w.data[i * c.ff_dim + j];
+            }
+            d_ff_up_act[t * c.ff_dim + j] = s;
+        }
+    }
+    // gelu backward
+    let mut d_ff_up_pre = vec![0.0f32; seq * c.ff_dim];
+    for t in 0..seq {
+        for j in 0..c.ff_dim {
+            d_ff_up_pre[t * c.ff_dim + j] =
+                d_ff_up_act[t * c.ff_dim + j] * gelu_deriv(lc.ff_up_pre[t * c.ff_dim + j]);
+        }
+    }
+    // dWff_up[k,j] += sum_t ln2_out[t,j] * d_ff_up_pre[t,k]
+    for t in 0..seq {
+        for k in 0..c.ff_dim {
+            let dl = d_ff_up_pre[t * c.ff_dim + k] * scale;
+            if dl == 0.0 {
+                continue;
+            }
+            for j in 0..d {
+                grads.ff_up[layer].data[k * d + j] += dl * lc.ln2_out[t * d + j];
+            }
+        }
+    }
+    // d_ln2_out = d_ff_up_pre @ Wff_up  → [seq, dim]
+    let mut d_ln2_out = vec![0.0f32; seq * d];
+    for t in 0..seq {
+        for j in 0..d {
+            let mut s = 0.0;
+            for k in 0..c.ff_dim {
+                s += d_ff_up_pre[t * c.ff_dim + k] * ff_up_w.data[k * d + j];
+            }
+            d_ln2_out[t * d + j] = s;
+        }
+    }
+    // ln2 backward — gain grad is local to this block; accumulate scaled.
+    let mut ln2_dgain = vec![0.0f32; d];
+    let dx_prime_from_ffn = layernorm_bwd(
+        &lc.ln2_in,
+        seq,
+        d,
+        &lc.ln2_out,
+        &d_ln2_out,
+        &lm.weights.ln2_gain[layer],
+        &mut ln2_dgain,
+    );
+    for j in 0..d {
+        grads.ln2_gain[layer][j] += scale * ln2_dgain[j];
+    }
+
+    // Residual: x' = x + attn_proj_out → d(attn_proj_out) = dx', dx' = dx + dx'_from_ffn.
+    let dx_prime: Vec<f32> = dy
+        .iter()
+        .zip(dx_prime_from_ffn.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+    let d_attn_proj_out = &dx_prime;
+
+    // dWattn_out[i,j] += sum_t attn_out[t,j] * d_attn_proj_out[t,i]
+    for t in 0..seq {
+        for i in 0..d {
+            let dl = d_attn_proj_out[t * d + i] * scale;
+            if dl == 0.0 {
+                continue;
+            }
+            for j in 0..d {
+                grads.attn_out[layer].data[i * d + j] += dl * lc.attn_out[t * d + j];
+            }
+        }
+    }
+    // d_attn_out = d_attn_proj_out @ Wattn_out  → [seq, dim]
+    let mut d_attn_out = vec![0.0f32; seq * d];
+    for t in 0..seq {
+        for j in 0..d {
+            let mut s = 0.0;
+            for i in 0..d {
+                s += d_attn_proj_out[t * d + i] * attn_out_w.data[i * d + j];
+            }
+            d_attn_out[t * d + j] = s;
+        }
+    }
+    // Attention backward → dqkv_out.
+    let dqkv_out = causal_attn_bwd(lc, &d_attn_out, seq, d, nh, hd);
+
+    // dWqkv[k,j] += sum_t ln1_out[t,j] * dqkv_out[t,k]
+    for t in 0..seq {
+        for k in 0..3 * d {
+            let dl = dqkv_out[t * 3 * d + k] * scale;
+            if dl == 0.0 {
+                continue;
+            }
+            for j in 0..d {
+                grads.qkv[layer].data[k * d + j] += dl * lc.ln1_out[t * d + j];
+            }
+        }
+    }
+    // d_ln1_out = dqkv_out @ Wqkv  → [seq, dim]
+    let mut d_ln1_out = vec![0.0f32; seq * d];
+    for t in 0..seq {
+        for j in 0..d {
+            let mut s = 0.0;
+            for k in 0..3 * d {
+                s += dqkv_out[t * 3 * d + k] * qkv_w.data[k * d + j];
+            }
+            d_ln1_out[t * d + j] = s;
+        }
+    }
+    // ln1 backward — gain grad local; dx_from_attn (to previous block) is discarded.
+    let mut ln1_dgain = vec![0.0f32; d];
+    let _dx_from_attn = layernorm_bwd(
+        &lc.ln1_in,
+        seq,
+        d,
+        &lc.ln1_out,
+        &d_ln1_out,
+        &lm.weights.ln1_gain[layer],
+        &mut ln1_dgain,
+    );
+    for j in 0..d {
+        grads.ln1_gain[layer][j] += scale * ln1_dgain[j];
+    }
+}
+
 // ---- Forward helpers (cached versions) ----
 
 fn layernorm_fwd(x: &[f32], seq: usize, dim: usize, gain: &[f32]) -> (Vec<f32>, Vec<f32>) {

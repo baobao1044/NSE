@@ -7,8 +7,8 @@
 use nse_core::sparse::TransmutedModel;
 use nse_models::{Tokenizer, ToyLm};
 
-use crate::ppl::{dense_ppl, sparse_ppl};
-use crate::sparse_forward::Activation;
+use crate::ppl::{dense_ppl, sparse_ppl_with_options};
+use crate::sparse_forward::{Activation, SparseOptions};
 
 /// A completed comparison report.
 #[derive(Debug, Clone)]
@@ -54,11 +54,26 @@ pub fn compare(
     seq_len: usize,
     act: Activation,
 ) -> CompareReport {
+    compare_with_options(lm, tm, corpus, seq_len, act, SparseOptions::default())
+}
+
+/// Like [`compare`] but with explicit kernel/index backend selection (used by
+/// the CLI `--kernel` / `--index` flags). The kernel (scalar vs AVX2) and the
+/// index (brute-force vs HNSW) only change *how* the sparse matmuls are
+/// evaluated, not the result — they should not affect PPL beyond FP noise.
+pub fn compare_with_options(
+    lm: &ToyLm,
+    tm: &TransmutedModel,
+    corpus: &[u8],
+    seq_len: usize,
+    act: Activation,
+    opts: SparseOptions,
+) -> CompareReport {
     let tok = Tokenizer::from_corpus(corpus);
     let ids = tok.encode(corpus);
 
     let ppl_dense = dense_ppl(lm, &ids, seq_len);
-    let ppl_sparse = sparse_ppl(tm, &ids, seq_len, act);
+    let ppl_sparse = sparse_ppl_with_options(tm, &ids, seq_len, act, opts);
 
     let rel_degradation = if ppl_dense > 0.0 {
         (ppl_sparse - ppl_dense) / ppl_dense

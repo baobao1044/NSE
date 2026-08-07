@@ -28,6 +28,8 @@ use nse_core::sparse::MicroExpert;
 pub enum KernelKind {
     /// Canonical scalar reference (mathematical ground truth).
     Scalar,
+    /// Force AVX2 (panics via `is_x86_feature_detected!` if unavailable).
+    Avx2,
     /// Auto-detect AVX2 at runtime; fall back to scalar if unavailable.
     Auto,
 }
@@ -39,9 +41,12 @@ impl Default for KernelKind {
 }
 
 impl KernelKind {
-    /// Returns true if this kind should dispatch to AVX2 (when available).
+    /// Returns true if this kind should dispatch to AVX2.
+    /// `Avx2` always dispatches (and the dispatch path itself re-checks the
+    /// CPU feature and falls back to scalar if missing, so a no-AVX2 machine
+    /// still works); `Auto` dispatches only when the CPU has AVX2.
     pub fn use_avx2(self) -> bool {
-        matches!(self, KernelKind::Auto)
+        matches!(self, KernelKind::Avx2 | KernelKind::Auto)
     }
 }
 
