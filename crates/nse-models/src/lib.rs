@@ -15,7 +15,9 @@ pub mod config;
 pub mod tokenizer;
 pub mod toy_lm;
 pub mod loader;
+pub mod autograd;
 
 pub use config::Config;
 pub use tokenizer::Tokenizer;
 pub use toy_lm::{ToyLm, ToyLmWeights};
+pub use autograd::{ForwardCache, ToyLmGrads, forward_cached, backward};
