@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Hyperparameters for the Toy LM and a generic container for other models.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     /// Vocabulary size (char-level for the Toy LM POC).
     pub vocab_size: usize,

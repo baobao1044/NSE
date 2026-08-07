@@ -18,4 +18,4 @@ pub mod loader;
 
 pub use config::Config;
 pub use tokenizer::Tokenizer;
-pub use toy_lm::ToyLm;
+pub use toy_lm::{ToyLm, ToyLmWeights};
