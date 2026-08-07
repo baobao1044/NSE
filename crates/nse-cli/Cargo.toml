@@ -1,0 +1,23 @@
+[package]
+name = "nse-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nse"
+path = "src/main.rs"
+
+[dependencies]
+nse-core.workspace = true
+nse-models.workspace = true
+nse-train.workspace = true
+nse-zstm.workspace = true
+nse-rie.workspace = true
+nse-ller.workspace = true
+nse-eval.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "nse-zstm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nse-core.workspace = true
+nse-models.workspace = true
+ndarray.workspace = true
+ndarray-rand.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

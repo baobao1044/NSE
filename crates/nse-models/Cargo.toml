@@ -1,0 +1,19 @@
+[package]
+name = "nse-models"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nse-core.workspace = true
+ndarray.workspace = true
+ndarray-rand.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+safetensors.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true

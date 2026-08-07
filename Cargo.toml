@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nse-core",
+    "crates/nse-models",
+    "crates/nse-train",
+    "crates/nse-zstm",
+    "crates/nse-rie",
+    "crates/nse-ller",
+    "crates/nse-eval",
+    "crates/nse-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/local/nse"
+
+[workspace.dependencies]
+# Core numerics
+ndarray = "0.16"
+ndarray-rand = "0.15"
+rand = "0.8"
+rand_distr = "0.4"
+# I/O & mmap
+memmap2 = "0.9"
+safetensors = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Parallelism
+rayon = "1.10"
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+# Errors
+anyhow = "1"
+thiserror = "1"
+# Internal crates (path)
+nse-core = { path = "crates/nse-core" }
+nse-models = { path = "crates/nse-models" }
+nse-train = { path = "crates/nse-train" }
+nse-zstm = { path = "crates/nse-zstm" }
+nse-rie = { path = "crates/nse-rie" }
+nse-ller = { path = "crates/nse-ller" }
+nse-eval = { path = "crates/nse-eval" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

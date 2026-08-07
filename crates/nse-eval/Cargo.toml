@@ -1,0 +1,16 @@
+[package]
+name = "nse-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nse-core.workspace = true
+nse-models.workspace = true
+nse-rie.workspace = true
+nse-ller.workspace = true
+ndarray.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
