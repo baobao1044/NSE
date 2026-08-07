@@ -72,6 +72,11 @@ pub struct ForwardForwardConfig {
     /// as the block's energy grows (a fixed θ saturates the positive term
     /// once `G_pos ≫ θ` and stops learning the positive direction).
     pub theta_ema: f32,
+    /// Per-weight max-norm clamp applied after each step (stabilizes FF: the
+    /// local goodness objective has no box constraint and otherwise lets block
+    /// energy grow unbounded → residual stream blows up → NaN logits). 0
+    /// disables the clamp.
+    pub weight_clip: f32,
     pub log_every: usize,
     pub seed: u64,
 }
@@ -87,6 +92,7 @@ impl Default for ForwardForwardConfig {
             max_grad_norm: 1.0,
             hebbian_embed_lr: 0.01,
             theta_ema: 0.99,
+            weight_clip: 1.0,
             log_every: 0,
             seed: 5,
         }
@@ -210,6 +216,25 @@ impl Trainer for ForwardForwardTrainer {
 
                 apply_step(model, &grads, vel, lr, cfg.momentum, cfg.max_grad_norm);
 
+                // Max-norm clamp: FF's local objective has no box constraint
+                // and otherwise lets block energy grow unbounded (residual
+                // stream → NaN). Clamping each weight to ±`weight_clip` after
+                // the step keeps the model stable. This is a standard FF
+                // stabilization; it does not change the *direction* of updates,
+                // only caps magnitude.
+                if cfg.weight_clip > 0.0 {
+                    let c = cfg.weight_clip;
+                    for w in model.weights.token_embed.data.iter_mut() {
+                        *w = w.clamp(-c, c);
+                    }
+                    for l in 0..n_layers {
+                        for w in model.weights.qkv[l].data.iter_mut() { *w = w.clamp(-c, c); }
+                        for w in model.weights.attn_out[l].data.iter_mut() { *w = w.clamp(-c, c); }
+                        for w in model.weights.ff_up[l].data.iter_mut() { *w = w.clamp(-c, c); }
+                        for w in model.weights.ff_down[l].data.iter_mut() { *w = w.clamp(-c, c); }
+                    }
+                }
+
                 // Light Hebbian association for the tied head (positive only):
                 // nudge the *next* token's embedding toward the context's final
                 // representation, which the head reads as logits = x_final_norm @ Eᵀ.
@@ -307,6 +332,9 @@ mod tests {
             seq_len: 16,
             epochs: 50,
             hebbian_embed_lr: 0.02,
+            // Looser clip than the CLI default (1.0) so the test corpus's
+            // goodness has room to separate (G_pos ≫ G_neg on real vs permuted).
+            weight_clip: 2.0,
             ..Default::default()
         });
         trainer.train(&mut lm, corpus).unwrap();

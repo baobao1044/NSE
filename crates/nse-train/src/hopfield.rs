@@ -66,6 +66,11 @@ pub struct HopfieldConfig {
     pub num_writes: usize,
     /// Retrieval sharpness β. Larger → sharper (more nearest-neighbor-like).
     pub beta: f32,
+    /// Scale of the value written into `ff_down` (after unit-normalizing).
+    /// Small values keep the residual stream bounded: the dense forward uses
+    /// GELU (not softmax retrieval), so the write acts as a small *nudge* of
+    /// the residual toward the target embedding rather than a hard overwrite.
+    pub value_scale: f32,
     pub log_every: usize,
     pub seed: u64,
 }
@@ -76,6 +81,7 @@ impl Default for HopfieldConfig {
             seq_len: 16,
             num_writes: 64,
             beta: 8.0,
+            value_scale: 0.1,
             log_every: 0,
             seed: 3,
         }
@@ -161,8 +167,14 @@ impl Trainer for HopfieldTrainer {
                 for j in 0..d {
                     ff_up[slot * d + j] = key[j] / kn;
                 }
+                // Normalize the value so the FFN output stays bounded (the
+                // dense forward uses GELU, not softmax retrieval, so large
+                // values would blow up the residual stream). A unit-norm value
+                // direction scaled by `value_scale` is a small nudge toward
+                // the target embedding.
+                let vn = value.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-8);
                 for j in 0..d {
-                    ff_down[j * ff_dim + slot] = value[j];
+                    ff_down[j * ff_dim + slot] = cfg.value_scale * value[j] / vn;
                 }
             }
         }

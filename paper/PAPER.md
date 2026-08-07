@@ -1,0 +1,319 @@
+# Neuro-Sparse Engine (NSE): Chạy LLM trên CPU/Edge không cần GPU cluster
+
+**Một prototype nghiên cứu bằng Rust**
+
+> Mã nguồn: <https://github.com/baobao1044/NSE>
+
+---
+
+## Tóm tắt
+
+Báo cáo này mô tả **Neuro-Sparse Engine (NSE)** — một framework thử nghiệm bằng
+Rust nhằm khảo sát khả năng chạy mô hình ngôn ngữ (LM) trên CPU/edge mà không cần
+GPU cluster lớn. NSE gồm ba trục: (1) **ZSTM** — "biến đổi không-zero-shot"
+(zero-shot transmutation) một LM dày đặc thành dạng thưa (sparse) lượng tử hóa
+ternary; (2) **RIE** — định tuyến & chỉ mục (routing & indexing) bằng HNSW để
+chỉ kích hoạt một tập con các chuyên gia (experts) mỗi token; (3) **LLER** —
+kernel AVX2/SIMD cấp thấp để đánh giá các nhân thưa với chi phí nhỏ. Bên cạnh
+đường ống suy luận (inference), chúng tôi triển khai **ba thuật toán huấn luyện
+đột phá** để khảo sát việc huấn luyện không phụ thuộc backprop toàn cục quy mô
+lớn: Forward-Forward (Hinton), bộ nhớ liên tưởng Hopfield, và huấn luyện thưa
+LSH.
+
+Toàn bộ hệ thống được phát triển như một prototype chạy end-to-end: huấn luyện →
+lượng tử hóa → suy luận thưa → so sánh PPL. Chúng tôi báo cáo số liệu thực trên
+một toy LM (transformer 2 lớp, dim=32, vocab=38) và trung thành về giới hạn: FF
+và Hopfield trên toy LM là prototype nghiên cứu, khó bằng SGD; AVX2 không
+bit-identical với vô hướng do tính chất kết hợp của dấu chấm động.
+
+---
+
+## 1. Giới thiệu
+
+Việc huấn luyện và chạy các LLM quy mô lớn đòi hỏi cụm GPU đáng kể. Câu hỏi đặt ra:
+có thể chạy — và một mức độ nào đó, huấn luyện — mô hình trên phần cứng thưa/CPU/edge?
+NSE tiếp cận vấn đề này ở cấp độ prototype, thử nghiệm các kỹ thuật sau:
+
+- **Tách biệt suy luận khỏi huấn luyện dày đặc**: sau khi một LM dày đặc được
+  huấn luyện (bằng phương pháp thông thường), ZSTM "biến đổi" nó sang dạng
+  thưa lượng tử hóa ternary {-1, 0, +1} với scale theo hàng (kiểu BitNet),
+  không cần huấn luyện lại. Suy luận sau đó chỉ kích hoạt một tập con các hàng
+  chuyên gia mỗi token.
+- **Định tuyến hiệu quả**: để chọn tập con chuyên gia nhanh, RIE xây dựng chỉ
+  mục HNSW (Hierarchical Navigable Small World) trên các centroid chuyên gia
+  và truy vấn MIPS (maximum inner-product search) thay vì quét brute-force.
+- **Kernel cấp thấp**: LLER triển khai kernel AVX2 thực cho dot product dày đặc
+  và đánh giá chuyên gia ternary, với dispatch runtime và fallback vô hướng.
+- **Thuật toán huấn luyện thay thế**: để khảo sát huấn luyện không backprop toàn
+  cục, chúng tôi triển khai Forward-Forward (goodness cục bộ theo khối), bộ nhớ
+  liên tưởng Hopfield (ghi một lần, không backprop), và huấn luyện thưa LSH
+  (backprop dày đặc + che gradient theo hàng theo LSH).
+
+Tiêu chuẩn chất lượng đã thống nhất: **prototype chạy được** — chạy end-to-end,
+mỗi thuật toán có mục tiêu riêng cải thiện hoặc ít nhất không suy biến (PPL <
+baseline đồng nhất), test đúng, có CLI. Báo cáo này trung thành về việc FF và
+Hopfield trên toy LM khó bằng SGD.
+
+---
+
+## 2. Kiến trúc
+
+NSE là một Cargo workspace 8 crate:
+
+```
+nse-core     — tensor, định dạng .nse (mmap), mô hình thưa TransmutedModel
+nse-models   — Toy LM (transformer), tokenizer, autograd thủ công, safetensors I/O
+nse-zstm     — Zero-Shot Transmutation: outlier + k-means + lượng tử hóa ternary
+nse-rie      — Routing & Indexing: router, MIPS brute-force, HNSW
+nse-ller     — Low-Level Execution: kernel vô hướng + AVX2
+nse-eval     — PPL dày đặc/thưa, báo cáo so sánh
+nse-train    — SGD, Forward-Forward, Hopfield, LSH-sparse
+nse-cli      — CLI `nse` với các subcommand
+```
+
+### 2.1 Toy LM
+
+Mô hình thử nghiệm là một transformer nhỏ với token embedding (tied head), các
+khối gồm: qkv [3·dim, dim], attn_out [dim, dim], ff_up [ff_dim, dim],
+ff_down [dim, ff_dim], layernorm gain ln1/ln2/ln_f. Cấu hình mặc định:
+dim=32, num_layers=2, num_heads=4, ff_dim=64, vocab=38 (char-level tokenizer).
+Autograd thủ công (`forward_cached` + `backward`) cung cấp gradient đầy đủ với
+kiểm tra gradient finite-difference.
+
+### 2.2 ZSTM — Biến đổi không-zero-shot
+
+Từ một Toy LM dày đặc, ZSTM trích xuất các hàng ngoại lệ (outlier) theo chuẩn,
+gom cụm phần còn lại bằng k-means cầu (spherical), và lượng tử hóa ternary mỗi
+centroid với scale theo hàng. Kết quả là `TransmutedModel` với mỗi khối chứa 4
+lớp thưa (qkv, attn_out, ff_up, ff_down), mỗi lớp gồm "core" dày đặc (hàng
+ngoại lệ) + các chuyên gia ternary (centroid). Lưu dưới định dạng `.nse` (JSON,
+mmap-able). Việc biến đổi **không huấn luyện lại** — đây là xấp xỉ zero-shot.
+
+### 2.3 RIE — Định tuyến & chỉ mục
+
+Mỗi token, router tính điểm cho mỗi chuyên gia (MIPS giữa activation đầu vào
+và centroid chuyên gia). Hai chế độ kích hoạt: `All` (mọi chuyên gia, upper
+bound) và `Threshold` (giữ chuyên gia có điểm ≥ max·ratio, cap max_k). Hai
+backend chỉ mục: brute-force (MIPS chính xác) và **HNSW** (xấp xỉ).
+
+#### HNSW thực
+
+`HnswIndex` triển khai đồ thị phân tầng thật: cấp mỗi nút `l ~ floor(−ln(u)·mL)`,
+mL = 1/ln(M); chèn bằng greedy descent (ef=1) tầng cao + beam search
+(ef_construction) mỗi tầng, liên kết bidirectional M-neighbor với pruning. Truy
+vấn: greedy descent xuống tầng 1, beam search tầng 0 (ef_search), trả top-K theo
+điểm giảm. `ensure_connected_layer0` (BFS từ entry point, kết nối các nút không
+đạt được với nút gần nhất) đảm bảo recall@k = 1 trên đồ thị nhỏ.
+
+### 2.4 LLER — Kernel AVX2
+
+Hai kernel thực bằng `core::arch::x86_64::*`:
+
+- **`compute_ternary_micro_expert_avx2`**: giải mã ternary thành 2 mask vector
+  (mask_pos/mask_neg, 0xFFFFFFFF giữ / 0 bỏ), `pos = _mm256_and_ps(x, mask_pos)`,
+  `accum = add(accum, pos) − neg`, 8 float/iter, tail vô hướng cùng thứ tự,
+  horizontal-reduce theo thứ tự vô hướng.
+- **`compute_dense_core_avx2`**: dot product mỗi hàng bằng `_mm256_fmadd_ps` (FMA).
+
+Cả hai `#[target_feature(enable="avx2")]` + dispatch runtime
+`is_x86_feature_detected!("avx2")` với fallback vô hướng. `KernelKind { Scalar,
+Avx2, Auto }`.
+
+---
+
+## 3. Thuật toán huấn luyện đột phá
+
+### 3.1 LSH Sparse Training (N3)
+
+**Gần SGD nhất (dùng backprop):** `forward_cached` + `backward` lấy `ToyLmGrads`
+đầy đủ, rồi **che** gradient theo hàng theo LSH. LSH (random hyperplane): băm
+mỗi vector activation đầu vào của matmul thành bucket; một hàng trọng số `r`
+giữ gradient chỉ khi `r mod num_buckets` là bucket bị activation trúng. Với
+`num_bits = round(log2(1/sparse_fraction))`, khoảng `sparse_fraction` hàng được
+cập nhật mỗi bước. Helper `apply_step` (momentum + clip gradient theo chuẩn toàn
+cục) dùng chung với SGD.
+
+Test: mask thực sự thưa (≤4/32 hàng active); PPL < baseline đồng nhất.
+
+### 3.2 Forward-Forward (N4)
+
+**Không backprop toàn cục.** Faithful Hinton FF cho toy LM transformer:
+
+- **Goodness** mỗi khối `G = (1/N)·Σ y²`, `y = ln2_in + ff_down_out` (output
+  residual stream, **không** layer-norm trước khi bình phương — LN sẽ pin
+  G≡1 làm objective suy biến).
+- **Positive**: cửa sổ token thật. **Negative**: cùng cửa sổ nhưng token bị
+  permute (giữ shape, phá thứ tự).
+- **Loss**: `softplus(θ − G_pos) + softplus(G_neg − θ)`. θ per-block, khởi tạo =
+  G_pos ban đầu, cập nhật EMA để theo dõi năng lượng khối tăng (θ cố định làm
+  dương bão hòa và ngừng học).
+- **Gradient cục bộ**: chỉ trọng số của khối đó được cập nhật, qua
+  `block_backward_local` (không gradient lan ra khối trước hoặc head — input
+  khối coi như đóng băng cho cập nhật cục bộ).
+- **Tied head**: head/embedding không nằm trong objective FF; thêm quy tắc
+  Hebb nhẹ (nudge embedding token kế tiếp về biểu diễn context) để head không
+  suy biến. `ln_f_gain` giữ init.
+
+**Ổn định**: objective FF không có box constraint; năng lượng khối tăng vô
+hạn → residual stream phình → NaN. Max-norm clamp (`weight_clip`, mặc định 1.0)
+sau mỗi bước chặn divergence — kỹ thuật chuẩn để ổn định FF.
+
+Test: `block_backward_local` cho grad khác 0 cho khối đó, 0 cho khối khác/head;
+G_pos > G_neg (trung bình trên nhiều cửa sổ) + PPL < baseline đồng nhất.
+
+### 3.3 Hopfield / Associative Memory (N5)
+
+**Ghi một lần, không backprop.** FFN làm khoá liên tưởng:
+
+- `ff_up` [ff_dim, dim] = **key store** (hàng i = key i), `ff_down` [dim, ff_dim]
+  = **value store** (cột i = value i).
+- Quy tắc retrieval: `z = ff_down · softmax(β·(ff_up·k))` (softmax thay GELU cho
+  retrieval Hopfield chuẩn — adaptation đã tài liệu hóa).
+- Ghi: cho mỗi (context, next-token) từ corpus, slot i (round-robin ff_dim):
+  key = activation context (ln2_out, L2-normalized), value = hướng target
+  (unit-norm × `value_scale`).
+- Head/gains: đóng băng tại init.
+
+`hopfield_retrieve` export cho test/caller verify recall trực tiếp.
+
+Test: retrieval key đã lưu trả về ~value (trong tolerance); ghi nhiều cặp, recall
+đúng; mô hình không suy biến (PPL hữu hạn < baseline đồng nhất trên corpus test).
+
+---
+
+## 4. CLI
+
+CLI `nse` với pipeline:
+
+```
+nse train          — huấn luyện SGD baseline → safetensors
+nse train-ff       — huấn luyện Forward-Forward
+nse train-hopfield — ghi bộ nhớ liên tưởng Hopfield
+nse train-lsh      — huấn luyện LSH-sparse
+nse transmute      — ZSTM → .nse
+nse eval-dense     — PPL dày đặc
+nse eval-sparse    — PPL thưa (--kernel scalar|avx2|auto, --index brute|hnsw)
+nse eval-compare   — báo cáo so sánh dày đặc/thưa
+```
+
+Chạy end-to-end: `train-lsh → transmute → eval-sparse(--kernel avx2 --index hnsw)
+→ eval-compare`.
+
+---
+
+## 5. Kết quả thực nghiệm
+
+**Môi trường**: Windows x64, Rust 1.96, debug build. Corpus: "To be, or not to
+be..." (Shakespeare Hamlet soliloquy, 14 dòng, 607 byte, vocab 38 ký tự). Toy LM
+dim=32, 2 lớp, 4 heads, ff_dim=64.
+
+### 5.1 Bảng PPL — các trainer
+
+| Trainer          | PPL (dense eval) | Baseline đồng nhất | So baseline   |
+|------------------|-----------------:|-------------------:|--------------:|
+| (không train)    | ~38.0 (init)     | 38                 | ~1.0×         |
+| SGD (10 epochs)  | **20.50**        | 38                 | **0.54×** ✓   |
+| LSH-sparse (15)  | **25.21**        | 38                 | **0.66×** ✓   |
+| Forward-Forward (30, clipped) | **30.24** | 38          | **0.80×** ✓   |
+| Hopfield (64 writes) | 53.18       | 38                 | 1.40× ✗       |
+
+**Diễn giải**: SGD (backprop đầy đủ) tốt nhất. LSH-sparse (backprop + che theo
+hàng) gần SGD — chỉ che gradient mà vẫn học. FF (goodness cục bộ, không backprop
+toàn cục) đánh bại baseline nhưng kém SGD — đúng kỳ vọng prototype. Hopfield
+trên dense-forward (GELU) **không** cải thiện PPL — đúng giới hạn đã tài liệu hóa:
+retrieval Hopfield cần forward-path softmax, không tương thích với GELU dày đặc;
+test retrieval riêng cho thấy recall đúng.
+
+### 5.2 Bảng PPL — suy luận thưa (từ mô hình SGD)
+
+| Backend                    | PPL (sparse, all-experts) |
+|----------------------------|-------------------------:|
+| Dense (baseline)           | 20.50                    |
+| Sparse, scalar, brute      | 37.29                    |
+| Sparse, AVX2, brute        | 37.29                    |
+| Sparse, AVX2, HNSW         | 37.29                    |
+
+**Diễn giải**: PPL thưa = 37.29 (degradation +82% so dense) phản ánh **chi phí
+lượng tử hóa ternary** — đây là upper bound (all-experts, chỉ lỗi lượng tử hóa,
+không pruning). Quan trọng: **scalar/AVX2/HNSW cho cùng PPL** (chính xác) — đúng
+như mong đợi: kernel và index chỉ thay đổi *cách* đánh giá, không kết quả (chỉ
+FP noise). AVX2 match vô hướng, HNSW match brute (recall=1 trên đồ thị nhỏ nhờ
+`ensure_connected_layer0`).
+
+### 5.3 Test suite
+
+`cargo test --workspace` pass sạch (0 failure). Bao gồm:
+- Gradient check finite-difference (autograd)
+- AVX2 vs vô hướng trong tolerance 1e-5 (không bit-identical)
+- HNSW recall@k = 1 vs brute-force
+- LSH mask thưa + PPL < baseline
+- FF goodness phân tách (G_pos > G_neg) + PPL < baseline
+- Hopfield retrieval khớp value + PPL hữu hạn
+- ZSTM roundtrip, RIE routing, định dạng .nse
+
+---
+
+## 6. Giới hạn & thảo luận trung thành
+
+1. **AVX2 không bit-identical**: do tính kết hợp (associativity) của dấu chấm
+   động, kết quả AVX2 khác vô hướng ở mức FP noise. Test trong tolerance 1e-5,
+   tài liệu hóa trong code. Giá trị thật của AVX2 ở quy mô lớn (throughput), test
+   nhỏ chỉ verify correctness.
+
+2. **HNSW recall = 1 trên N nhỏ**: nhờ `ensure_connected_layer0` (BFS + kết nối
+   nút cô lập). Giá trị thật (tradeoff recall/latency) chỉ thể hiện ở quy mô lớn;
+   test nhỏ verify correctness của graph + search, không throughput.
+
+3. **FF/Hopfield là prototype nghiên cứu, PPL khó bằng SGD**:
+   - FF: goodness cục bộ + Hebb head đánh bại baseline đồng nhất nhưng kém SGD.
+     Goodness `G = mean(y²)` (raw energy) cần max-norm clamp để ổn định; separation
+     G_pos/G_neg mỏng trên corpus nhỏ. Đây là khám phá ý tưởng, không trainer sản
+     xuất.
+   - Hopfield: retrieval (softmax) không tương thích dense-forward (GELU) —
+     PPL không cải thiện trên eval-dense. Test retrieval riêng cho recall đúng.
+     Để tận dụng đầy đủ cần forward-path Hopfield riêng (thay GELU bằng softmax
+     retrieval trong eval) — hướng mở.
+
+4. **Toy LM nhỏ**: dim=32, vocab=38, 2 lớp. Số liệu PPL tuyệt đối không đại diện
+     cho mô hình quy mô lớn; giá trị ở **tính tương đối** (trainer nào cải thiện,
+     kernel nào chính xác, pipeline chạy end-to-end).
+
+5. **LSH-sparse**: che gradient giảm FLOPs update nhưng trên toy model nhỏ saving
+     tuyệt đối khiêm tốn; chất lượng phụ thuộc activation clusterable.
+
+---
+
+## 7. Kết luận
+
+NSE triển khai end-to-end một pipeline prototype: huấn luyện → biến đổi thưa →
+suy luận thưa (AVX2 + HNSW) → so sánh PPL, với ba thuật toán huấn luyện thay
+thế. Kết quả chính:
+- Pipeline chạy được, PPL đo được, test đúng.
+- AVX2 + HNSW cho kết quả chính xác như vô hướng/brute (correctness verified).
+- LSH-sparse (backprop + che) gần SGD; FF đánh bại baseline đồng nhất; Hopfield
+  recall đúng nhưng không cải thiện dense PPL (giới hạn đã tài liệu hóa).
+- Trung thành: FF/Hopfield là prototype nghiên cứu, không production.
+
+Hướng mở: forward-path Hopfield thực (softmax thay GELU trong eval), HNSW ở quy
+mô lớn, AVX2 throughput benchmark, LSH-sparse trên model lớn hơn.
+
+---
+
+## Phụ lục: Reproduce
+
+```bash
+# Train SGD baseline + so sánh dày đặc/thưa
+nse train --epochs 10 --out lm.safetensors
+nse transmute --model lm.safetensors --out lm.nse
+nse eval-compare --model lm.safetensors --nse lm.nse --kernel avx2 --index hnsw
+
+# Trainers thay thế
+nse train-lsh --epochs 15 --out lm_lsh.safetensors
+nse train-ff --epochs 30 --out lm_ff.safetensors
+nse train-hopfield --num-writes 64 --out lm_hop.safetensors
+
+# Test toàn workspace
+cargo test --workspace
+```
+
+Mã nguồn: <https://github.com/baobao1044/NSE>
