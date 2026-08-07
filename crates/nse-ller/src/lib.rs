@@ -10,6 +10,7 @@
 //!   must match the scalar results bit-for-bit.
 //! - `tiling` — L3 cache tiling (no-op in the POC; experts are already
 //!   cache-sized by ZSTM).
+//! - `avx2` — real AVX2 kernels with runtime auto-detection (`KernelKind`).
 
 #![allow(dead_code)]
 
@@ -17,4 +18,7 @@ pub mod avx2;
 pub mod kernel;
 pub mod tiling;
 
+pub use avx2::{
+    compute_dense_core_dispatch, compute_ternary_micro_expert_dispatch, KernelKind,
+};
 pub use kernel::{apply_bias, compute_dense_core, compute_ternary_micro_expert_scalar};

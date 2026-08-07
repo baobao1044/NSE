@@ -1,126 +1,78 @@
-# Plan: Scaffold toàn hệ thống Neuro-Sparse Engine (NSE) bằng Rust
+# Plan: Implement AVX2 kernels, HNSW index, and 3 breakthrough training algorithms
 
-## 0. Bối cảnh & định hướng
+Bar đã chốt: **nguyên mẫu chạy được** — mỗi thuật toán chạy end-to-end, objective riêng cải thiện / mô hình không suy biến (PPL < uniform baseline), có test đúng; tích hợp CLI + runtime. Trung thực: FF/Hopfield trên toy LM là prototype nghiên cứu, khó bằng SGD.
 
-Spec gốc (inference) + mở rộng training thay thế từ bạn → hệ thống thống nhất gồm:
+## N1 — AVX2 kernels (nse-ller)
 
-- **Inference (NSE gốc, Zero-Shot):** ZSTM (chuyển đổi offline) + RIE (định tuyến O(log N)) + LLER (kernel SIMD + cache tiling) + format `.nse`.
-- **Training thay thế (đột phá, không phụ thuộc cluster GPU khổng lồ):**
-  1. **Forward-Forward / Predictive Coding** (Hinton) — local goodness, không backprop, zero VRAM overhead.
-  2. **Hopfield / Associative Memory** — energy-based, one-shot/few-shot learning bằng vector projection.
-  3. **LSH Sparse Weight Training** — chỉ cập nhật ~0.01% trọng số mỗi step (dùng chung index LSH với RIE inference).
-- **POC:** Toy LM đơn giản (Rust), **kết quả quan trọng nhất = đo sụt giảm PPL** dense (gốc) vs sparse (NSE).
+**Thực:** `compute_ternary_micro_expert_avx2` + `compute_dense_core_avx2` bằng `core::arch::x86_64::*`:
+- Ternary: decode 2-bit codes → 2 mask vectors (`mask_pos`/`mask_neg`, 0xFFFFFFFF để giữ / 0x00000000 để bỏ, tạo bằng `_mm256_cmpgt_ps`/blend). `pos_vals = _mm256_and_ps(x, mask_pos)`, `accum = _mm256_add_ps(accum, pos_vals)`, `accum = _mm256_sub_ps(accum, neg_vals)`. 8 floats/iter, tail scalar theo cùng thứ tự. Cuối horizontal-reduce theo thứ tự vô hướng.
+- Dense core: dot product mỗi row bằng `_mm256_fmadd_ps` (FMA), tail scalar.
+- Cả hai `#[target_feature(enable = "avx2")]` + `#[cfg(target_arch = "x86_64")]`.
 
-Ngôn ngữ: **Rust**. Thư mục `C:\Users\Admin\Downloads\NSE` hiện trống → greenfield.
+**Wire:** thêm `KernelKind { Scalar, Auto }` vào nse-rie; `sparse_linear` nhận `KernelKind`, gọi `compute_ternary_micro_expert_dispatch` (đã có runtime `is_x86_feature_detected!("avx2")`) khi `Auto`. `sparse_linear` cũ giữ = `Auto`.
 
-## 1. Cấu trúc workspace (Cargo workspace, 8 crate)
+**Test:** random expert+x, so AVX2 vs scalar trong tolerance 1e-5 (không bit-identical do FP non-associativity — tài liệu hóa). dense_core AVX2 vs scalar.
 
-```
-NSE/
-├── Cargo.toml                 # [workspace]
-├── README.md
-├── docs/
-│   ├── 01-nse-inference-spec.md   # spec bạn paste (ZSTM/RIE/LLER/.nse/pseudocode)
-│   └── 02-training-vision.md      # 3 thuật toán training thay thế (FF/Hopfield/LSH-sparse)
-├── data/
-│   └── corpus.txt             # corpus nhỏ (vd subset tinyshakespeare) cho train Toy LM
-├── crates/
-│   ├── nse-core/     # types, traits, errors, format .nse (mmap), Tensor, ModelSource
-│   ├── nse-models/   # Toy LM + tokenizer + safetensors loader + config
-│   ├── nse-train/    # Trainer trait + SgdTrainer(baseline REAL) + FF/Hopfield/LshSparse(STUB)
-│   ├── nse-zstm/     # offline: outlier + clustering(k-means) + quantization(ternary/PQ)
-│   ├── nse-rie/      # MIPS index(HNSW/LSH) + threshold router + static bias compensator
-│   ├── nse-ller/     # cache tiling + SIMD kernel(ternary/PQ) — scalar ref + AVX2
-│   ├── nse-eval/     # PPL dense vs sparse + báo cáo so sánh
-│   └── nse-cli/      # bin: train / transmute / infer / eval
-├── tests/            # integration tests (round-trip .nse, correctness, PPL sanity)
-└── benches/          # benchmark skeleton (dense vs sparse latency)
-```
+## N2 — HNSW index thật (nse-rie/hnsw.rs)
 
-Phụ thuộc tối giản, ưu tiên pure-Rust để build sạch trên Windows: `ndarray`, `ndarray-rand`/`rand`, `memmap2` (mmap `.nse`), `safetensors` (load), `rayon` (song song), `clap` (CLI), `anyhow`/`thiserror`. HNSW/k-means tự viết bản đơn giản cho POC (không phụ thuộc crate nặng).
+**Thực:** HNSW đồ thị phân tầng:
+- Build: layer mỗi node `l ~ floor(-ln(unif)*mL)`, mL=1/ln(M). Chèn: greedy search từ entry point tầng cao xuống, mỗi tầng chọn `M` neighbor gần nhất (distance = `-inner_product`, centroid đã unit-norm từ ZSTM → cosine). Lưu adjacency `Vec<Vec<Vec<u32>>>` (layer→node→neighbors).
+- Query: greedy descent tầng >0 (ef=1) → beam search tầng 0 (ef=ef_search) → trả top-K theo score giảm.
+- `HnswIndex::new(experts, m, ef_construction, ef_search)`, `query(x, k) -> Vec<Hit>`.
 
-## 2. Độ "thật" của từng module (scaffold nhưng PPL path chạy được)
+**Wire:** thêm `IndexKind { Brute, Hnsw }`; trait `MipsQuery { fn query_all(&self, x) -> Vec<Hit> }` với 2 impl (MipsIndex, HnswIndex). `sparse_forward` nhận `IndexKind` trong struct `SparseOptions { kernel, index }`.
 
-| Crate | Phần REAL (chạy được) | Phần SCAFFOLD (trait + stub + TODO) |
-|---|---|---|
-| **nse-core** | `NSEFileHeader`, `MicroExpertMeta` đúng spec; read/write `.nse` + mmap; `Tensor`/`Matrix`; `ModelSource` trait; error types; magic `"NSE1"` | — |
-| **nse-models** | Toy LM (mini transformer-LM 2 layer, d~128, vocab~1k); tokenizer char-level (bundled); safetensors loader linh hoạt; `Config` | kiến trúc Llama thật (sau) |
-| **nse-train** | `SgdTrainer` baseline (train Toy LM ra PPL hợp lý) | `ForwardForwardTrainer`, `HopfieldTrainer`, `LshSparseTrainer` — trait + skeleton + TODO + doc |
-| **nse-zstm** | Outlier extraction (top-k theo biên độ); spherical k-means (bản đơn giản); ternary encode (4 weight/byte) | SVD decomposition; PQ codebook |
-| **nse-rie** | Brute-force MIPS (đúng cho POC); adaptive threshold router; static bias compensator | HNSW; LSH scale lớn |
-| **nse-ller** | **Scalar reference kernel** (ternary math đúng → dùng cho PPL) | AVX2 `_mm256_*` kernel (target_feature, có scalar fallback); L3 cache tiling; PQ shuffle kernel |
-| **nse-eval** | Tính PPL; runner dense; runner sparse; báo cáo so sánh (PPL + % sụt giảm) | — |
-| **nse-cli** | `train`, `transmute`, `eval dense`, `eval sparse`, `eval compare` | subcommand FF/Hopfield/LSH (stub) |
+**Test:** recall@k == 1 vs brute-force trên N nhỏ (centroid unit ngẫu nhiên). Top-K khớp thứ tự.
 
-**Lý do:** Để đo "sụt giảm PPL" đúng, chỉ cần kernel **đúng về mặt toán học** — AVX2/HNSW/L3-tiling là tối ưu hiệu năng, không đổi kết quả số học → để scaffold. Toàn bộ optimization & 3 thuật toán training nghiên cứu để skeleton + trait, có sẵn chỗ cắm.
+## N3 — LSH Sparse Training (nse-train/lsh_sparse.rs)
 
-## 3. Pipeline POC end-to-end (deliverable chính = báo cáo PPL)
+**Gần SGD nhất (dùng backprop):** `forward_cached` + `backward` lấy `ToyLmGrads` đầy đủ, rồi **mask** grad theo LSH.
+- LSH: random hyperplanes (dùng `rand`), hash mỗi weight-row của mỗi matmul → bucket. Mỗi step, hash *input activation* của matmul (lấy từ `LayerCache`: `ln1_out` cho qkv, `attn_out` cho attn_out, `ln2_out` cho ff_up, `ff_up_act` cho ff_down) → chọn các row cùng bucket = relevant; zero grad các row còn lại. `sparse_fraction` điều khiển num hashes/buckets.
+- Reuse helper `apply` (momentum+clip) của SGD — factor ra `sgd_apply.rs` chung, cả SGD + LSH dùng.
+- Thêm module `lsh.rs` (local, dùng `rand`) — không thêm cross-crate dep.
 
-```
-1. cargo run --release -- train          → train Toy LM (SgdTrainer) trên data/corpus.txt → toy_lm.safetensors
-2. cargo run --release -- eval dense    → PPL_dense  (baseline)
-3. cargo run --release -- transmute     → ZSTM: outlier + k-means + ternary → model.nse
-4. cargo run --release -- eval sparse   → RIE + LLER(scalar) + bias → PPL_sparse
-5. cargo run --release -- eval compare  → in bảng: PPL_dense | PPL_sparse | % sụt giảm | num params active
-```
+**Test:** mask thực sự thưa (đếm row selected ≈ sparse_fraction); PPL < uniform baseline sau train.
 
-Mỗi bước là một lệnh CLI độc lập, có artifact trung gian (`.safetensors`, `.nse`) → dễ debug từng giai đoạn.
+## N4 — Forward-Forward (nse-train/forward_forward.rs)
 
-## 4. Format `.nse` (theo đúng spec, struct trong nse-core)
+**Không backprop toàn cục.** Faithful Hinton FF cho Toy LM:
+- Mỗi block (layer) có goodness `G = (1/d)·Σ a²` (a = residual-stream output block, đã LN).
+- Positive pass: window token thật. Negative pass: window token bị permute (giữ shape).
+- Local loss: `softplus(θ − G_pos) + softplus(G_neg − θ)`; cập nhật **chỉ weight của block đó** bằng local gradient `dG/dW` — viết `block_local_forward`/`block_local_backward` tái dùng helper của autograd (layernorm/matmul/attention/gelu) nhưng **một block**.
+- Tied head `token_embed`/`ln_f`: thêm goodness head riêng (logits positive=next-token đúng, negative=sai) để embed không suy biến; hoặc để Xavier init + light Hebbian. Tài liệu hóa adaptation.
+- Per-layer train tuần tự (layer-wise, song song khả thi).
 
-```rust
-struct NSEFileHeader {
-    magic: [u8; 4],            // "NSE1"
-    total_params: u64,
-    num_layers: u32,
-    dense_core_size: u32,      // bytes — Outlier Core
-    codebook_size: u32,        // bytes — Codebook (PQ)
-    index_tree_offset: u64,   // con trỏ MIPS Tree
-}
-struct MicroExpertMeta {
-    expert_id: u32,
-    num_channels: u32,
-    data_offset: u64,          // vị trí data nén sub-1-bit
-    // centroid_vector: float[dim]  // biến length, nằm kế tiếp
-}
-```
-Layout tối ưu mmap: header → dense core → codebook → micro-experts data → MIPS tree. Load bằng `memmap2`, zero-copy truy cập.
+**Test:** G_pos tăng, G_neg giảm sau train trên tiny corpus; mô hình ra PPL < uniform.
 
-## 5. Tests & benches
+## N5 — Hopfield / Associative Memory (nse-train/hopfield.rs)
 
-- **tests:** round-trip `.nse` (write→read→so); ternary encode/decode; transmutation correctness (sparse output ≈ dense cho input cố định, trong tolerance); bias compensation bù đúng; PPL sanity (PPL_sparse không tệ hơn ngưỡng cho phép).
-- **benches:** skeleton đo latency dense vs sparse inference (criterion, sau).
+**One-shot writes, không backprop.** Dùng FFN làm associative memory:
+- `ff_up` [ff_dim, dim] = **key store** (mỗi row 1 key), `ff_down` [dim, ff_dim] = **value store**. Tích `ff_down @ ff_up ≈ M` có `M·k ≈ v` với key trực giao.
+- Với mỗi (context key `k`, target value `v`) từ corpus: gán slot `i` (round-robin ff_dim), viết `ff_up[i,:] = k` (normalize), `ff_down[:,i] = v`. Key = activation context (ln2_out), value = embedding token mục tiêu (để retrieval → dự đoán next-token qua tied head).
+- `beta` = sharpness; retrieval `z = ff_down @ softmax(β·(ff_up @ k))` (softmax thay GELU cho retrieval chuẩn Hopfield — tài liệu hóa).
+- Gains/token_embed: freeze hoặc set analytic.
 
-## 6. Milestones
+**Test:** với key đã lưu, retrieval z khớp value (trong tolerance); viết nhiều cặp, recall đúng; mô hình không suy biến.
 
-- **M0:** Verify toolchain (`cargo`/`rustc`/`git`); init git + Cargo workspace + 8 crate skeletons (compiles, `cargo build`/`cargo test` pass rỗng).
-- **M1:** `nse-core` (.nse round-trip + mmap) + `nse-models` (Toy LM forward + tokenizer). Toy LM forward chạy được.
-- **M2:** `nse-train` SgdTrainer → train Toy LM ra PPL hợp lý trên corpus nhỏ.
-- **M3:** `nse-zstm` (outlier + k-means + ternary) → xuất `.nse` từ Toy LM đã train.
-- **M4:** `nse-rie` (brute-force MIPS + threshold + bias) + `nse-ller` scalar kernel → sparse inference đúng.
-- **M5:** `nse-eval` + `nse-cli` → **báo cáo so sánh PPL dense vs sparse** (deliverable chính).
-- **M6:** Scaffold phần còn lại: AVX2 kernel, HNSW, L3 cache tiling, PQ, và 3 thuật toán training (FF/Hopfield/LSH-sparse) — trait + stub + doc + TODO.
+## N6 — CLI + runtime integration (nse-cli)
 
-## 7. Ngoài scope (sau)
+- Subcommand mới: `train-ff`, `train-hopfield`, `train-lsh` (mirror `train`, gọi trainer mới, save safetensors).
+- `eval-sparse`/`eval-compare`: thêm cờ `--kernel scalar|avx2|auto` và `--index brute|hnsw`, thread qua `SparseOptions` vào `sparse_forward`.
+- Chạy end-to-end: train-lsh → eval-compare với --kernel avx2 --index hnsw.
 
-- Tối ưu AVX2 thực tế + benchmark hiệu năng.
-- HNSW/LSH ở quy mô 2.7T; L3 cache tiling engine thật.
-- PQ codebook đầy đủ.
-- Implement thật 3 thuật toán training thay thế (FF/Hopfield/LSH-sparse) — scaffold lần này.
-- Tích hợp Llama-3-8B thật.
+## Test tổng
+- 32 test cũ vẫn pass; thêm: AVX2 vs scalar, HNSW recall, FF goodness, Hopfield retrieval, LSH sparsity+PPL.
+- Build sạch `cargo build --workspace`; `cargo test --workspace` pass.
 
-## 8. Lệnh build/run dự kiến
+## Milestones
+- **N1** AVX2 kernels + wire + tests
+- **N2** HNSW + IndexKind + tests + wire sparse_forward
+- **N3** LSH-sparse trainer (reuses backprop) + factor apply helper + tests
+- **N4** Forward-Forward (per-block local goodness) + tests
+- **N5** Hopfield (associative writes) + tests
+- **N6** CLI (train-ff/hopfield/lsh, --kernel, --index) + end-to-end
 
-```bash
-cargo build --release
-cargo test
-cargo run --release -- train
-cargo run --release -- eval dense
-cargo run --release -- transmute --in toy_lm.safetensors --out model.nse
-cargo run --release -- eval sparse --nse model.nse
-cargo run --release -- eval compare --nse model.nse --weights toy_lm.safetensors
-```
-
-## Lưu ý
-- Bước **M0** đầu tiên tôi sẽ kiểm tra xem máy có Rust toolchain chưa; nếu chưa có, sẽ báo bạn và hướng dẫn cài trước khi scaffold.
-- Toàn bộ math dùng **scalar reference đúng** làm chân lý để đo PPL; AVX2/HNSW chỉ là tối ưu sau, không ảnh hưởng kết quả PPL → POC trung thực.
+## Trung thực về giới hạn
+- AVX2 không bit-identical (FP non-associativity) → test trong tolerance, tài liệu hóa.
+- FF/Hopfield trên toy LM = prototype nghiên cứu, PPL khó bằng SGD → bar = chạy được + objective cải thiện + không suy biến.
+- HNSW recall = 1 trên N nhỏ (giá trị thật ở quy mô lớn) → test nhỏ + tài liệu hóa.

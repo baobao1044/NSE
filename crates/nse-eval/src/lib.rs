@@ -17,5 +17,5 @@ pub mod ppl;
 pub mod sparse_forward;
 
 pub use compare::{compare, CompareReport};
-pub use ppl::{dense_ppl, sparse_ppl, perplexity_from_logprobs, logprobs};
-pub use sparse_forward::{sparse_forward, Activation};
+pub use ppl::{dense_ppl, sparse_ppl, sparse_ppl_with_options, perplexity_from_logprobs, logprobs};
+pub use sparse_forward::{sparse_forward, sparse_forward_with_options, Activation, SparseOptions};

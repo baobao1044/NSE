@@ -25,34 +25,90 @@ pub mod index;
 pub mod router;
 
 pub use bias::{apply as apply_bias, apply_layer};
+pub use hnsw::HnswIndex;
 pub use index::{Hit, MipsIndex};
 pub use router::{route_all, route_by_ratio, RouterConfig};
 
+// Re-export the kernel selector so callers can choose Scalar vs AVX2.
+pub use nse_ller::KernelKind;
+
 use nse_core::sparse::SparseLayer;
 use nse_ller::{
-    apply_bias as ller_apply_bias, compute_dense_core, compute_ternary_micro_expert_scalar,
+    apply_bias as ller_apply_bias, compute_dense_core_dispatch,
+    compute_ternary_micro_expert_dispatch,
 };
+
+/// Which MIPS backend to use for expert routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKind {
+    /// Exact brute-force (O(N), canonical).
+    Brute,
+    /// Approximate HNSW (O(log N)).
+    Hnsw,
+}
+
+impl Default for IndexKind {
+    fn default() -> Self {
+        IndexKind::Brute
+    }
+}
+
+/// Trait abstracting "return every expert hit, sorted by score descending",
+/// so the router can work with either backend.
+pub trait MipsQuery {
+    fn query_all(&self, x: &[f32]) -> Vec<Hit>;
+}
+
+impl<'a> MipsQuery for MipsIndex<'a> {
+    fn query_all(&self, x: &[f32]) -> Vec<Hit> {
+        MipsIndex::query_all(self, x)
+    }
+}
+
+impl MipsQuery for HnswIndex {
+    fn query_all(&self, x: &[f32]) -> Vec<Hit> {
+        // Return every expert (k = N), sorted descending — matches brute force.
+        // For the POC's small expert counts, querying with k = N and a large
+        // ef_search gives exact recall; at the spec's scale HNSW's value is
+        // the sub-linear search, not recall on tiny graphs.
+        self.query(x, self.num_experts())
+    }
+}
+
+/// Build an HNSW index over a [`SparseLayer`]'s experts with POC-friendly
+/// defaults (large ef so small expert counts give exact recall).
+pub fn build_hnsw_for_layer(sl: &SparseLayer) -> HnswIndex {
+    HnswIndex::new(&sl.experts, 8, 32, sl.experts.len().max(16))
+}
 
 /// Sparse forward of one linear layer: `y = core(x) + sum_activated experts(x)
 /// + bias`. `activated` is the set of expert indices (into `sl.experts`) to
 /// compute; the rest are pruned and their average contribution is covered by
-/// the static bias.
-pub fn sparse_linear(
+/// the static bias. `kind` selects the compute kernel (`Scalar` = canonical,
+/// `Auto` = AVX2 if available, else scalar).
+pub fn sparse_linear_with_kernel(
     sl: &SparseLayer,
     x: &[f32],
     activated: &[usize],
+    kind: KernelKind,
 ) -> Vec<f32> {
     let mut y = vec![0.0f32; sl.out_dim];
     // Dense core (always on).
-    compute_dense_core(&sl.dense_core, &sl.core_row_ids, x, &mut y);
+    compute_dense_core_dispatch(&sl.dense_core, &sl.core_row_ids, x, &mut y, kind);
     // Activated micro-experts.
     for &eid in activated {
         let expert = &sl.experts[eid];
-        compute_ternary_micro_expert_scalar(expert, x, &mut y);
+        compute_ternary_micro_expert_dispatch(expert, x, &mut y, kind);
     }
     // Static bias (compensates pruned experts on average).
     ller_apply_bias(&sl.bias, &mut y);
     y
+}
+
+/// Sparse forward with the default (`Auto`) kernel — backward-compatible with
+/// the original POC entry point.
+pub fn sparse_linear(sl: &SparseLayer, x: &[f32], activated: &[usize]) -> Vec<f32> {
+    sparse_linear_with_kernel(sl, x, activated, KernelKind::Auto)
 }
 
 /// Sparse forward with **all** experts activated — the upper-bound reference.

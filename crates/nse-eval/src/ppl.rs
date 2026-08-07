@@ -58,11 +58,23 @@ pub fn dense_ppl(lm: &ToyLm, ids: &[u32], seq_len: usize) -> f32 {
 
 /// PPL of the sparse [`TransmutedModel`] over a sliding window of length
 /// `seq_len`, predicting t+1, using the given [`Activation`](super::sparse_forward::Activation).
+/// Uses default runtime options (scalar kernel, brute-force index).
 pub fn sparse_ppl(
     tm: &TransmutedModel,
     ids: &[u32],
     seq_len: usize,
     act: super::sparse_forward::Activation,
+) -> f32 {
+    sparse_ppl_with_options(tm, ids, seq_len, act, super::sparse_forward::SparseOptions::default())
+}
+
+/// Sparse PPL with explicit runtime options (kernel + index).
+pub fn sparse_ppl_with_options(
+    tm: &TransmutedModel,
+    ids: &[u32],
+    seq_len: usize,
+    act: super::sparse_forward::Activation,
+    opts: super::sparse_forward::SparseOptions,
 ) -> f32 {
     let vocab = tm.config.vocab_size;
     let mut total_lp = 0.0f32;
@@ -70,7 +82,7 @@ pub fn sparse_ppl(
     for start in 0..ids.len().saturating_sub(seq_len + 1) {
         let tokens = &ids[start..start + seq_len];
         let targets = &ids[start + 1..start + 1 + seq_len];
-        let logits = super::sparse_forward::sparse_forward(tm, tokens, act);
+        let logits = super::sparse_forward::sparse_forward_with_options(tm, tokens, act, opts);
         let lp = logprobs(&logits, targets, vocab);
         total_lp += lp.iter().sum::<f32>();
         count += lp.len();

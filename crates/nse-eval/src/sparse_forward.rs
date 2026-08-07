@@ -12,7 +12,7 @@
 //! ternary quantization error remains — the upper bound on sparse quality.
 
 use nse_core::sparse::{SparseLayer, TransmutedModel, IDX_ATTN_OUT, IDX_FF_DOWN, IDX_FF_UP, IDX_QKV};
-use nse_rie::{sparse_linear, MipsIndex, route_all, route_by_ratio, RouterConfig};
+use nse_rie::{route_all, route_by_ratio, RouterConfig};
 
 const EPS_LN: f32 = 1e-5;
 
@@ -34,8 +34,37 @@ impl Default for Activation {
     }
 }
 
-/// Sparse forward: returns logits `[seq, vocab]` (row-major).
+/// Runtime options for the sparse forward: compute kernel + MIPS index.
+#[derive(Debug, Clone, Copy)]
+pub struct SparseOptions {
+    /// Compute kernel: scalar (canonical) or AVX2 (auto-detected).
+    pub kernel: nse_rie::KernelKind,
+    /// MIPS index backend: brute-force (canonical) or HNSW.
+    pub index: nse_rie::IndexKind,
+}
+
+impl Default for SparseOptions {
+    fn default() -> Self {
+        Self {
+            kernel: nse_rie::KernelKind::Scalar,
+            index: nse_rie::IndexKind::Brute,
+        }
+    }
+}
+
+/// Sparse forward: returns logits `[seq, vocab]` (row-major), with default
+/// options (scalar kernel, brute-force index). Backward-compatible entry point.
 pub fn sparse_forward(tm: &TransmutedModel, tokens: &[u32], act: Activation) -> Vec<f32> {
+    sparse_forward_with_options(tm, tokens, act, SparseOptions::default())
+}
+
+/// Sparse forward with explicit runtime options (kernel + index).
+pub fn sparse_forward_with_options(
+    tm: &TransmutedModel,
+    tokens: &[u32],
+    act: Activation,
+    opts: SparseOptions,
+) -> Vec<f32> {
     let cfg = &tm.config;
     let seq = tokens.len();
     let d = cfg.dim;
@@ -59,19 +88,19 @@ pub fn sparse_forward(tm: &TransmutedModel, tokens: &[u32], act: Activation) -> 
 
         // --- Attention sub-block ---
         let h = layernorm(&x, seq, d, ln1); // [seq, dim]
-        let qkv_out = sparse_linear_seq(&block[IDX_QKV], &h, act); // [seq, 3*dim]
+        let qkv_out = sparse_linear_seq(&block[IDX_QKV], &h, act, opts); // [seq, 3*dim]
         let (q, k, v_proj) = split_qkv(&qkv_out, seq, d);
         let attn = causal_self_attention(&q, &k, &v_proj, seq, d, nh);
-        let attn_proj = sparse_linear_seq(&block[IDX_ATTN_OUT], &attn, act); // [seq, dim]
+        let attn_proj = sparse_linear_seq(&block[IDX_ATTN_OUT], &attn, act, opts); // [seq, dim]
         for i in 0..seq * d {
             x[i] += attn_proj[i];
         }
 
         // --- FFN sub-block ---
         let h2 = layernorm(&x, seq, d, ln2); // [seq, dim]
-        let mut up = sparse_linear_seq(&block[IDX_FF_UP], &h2, act); // [seq, ff_dim]
+        let mut up = sparse_linear_seq(&block[IDX_FF_UP], &h2, act, opts); // [seq, ff_dim]
         gelu_inplace(&mut up);
-        let down = sparse_linear_seq(&block[IDX_FF_DOWN], &up, act); // [seq, dim]
+        let down = sparse_linear_seq(&block[IDX_FF_DOWN], &up, act, opts); // [seq, dim]
         for i in 0..seq * d {
             x[i] += down[i];
         }
@@ -94,27 +123,35 @@ pub fn sparse_forward(tm: &TransmutedModel, tokens: &[u32], act: Activation) -> 
     logits
 }
 
-/// Run [`nse_rie::sparse_linear`] over each row of `h [seq, in]`, stacking
-/// outputs into `[seq, out]`.
-fn sparse_linear_seq(sl: &SparseLayer, h: &[f32], act: Activation) -> Vec<f32> {
+/// Run [`nse_rie::sparse_linear_with_kernel`] over each row of `h [seq, in]`,
+/// stacking outputs into `[seq, out]`. Selects the index backend and kernel
+/// from `opts`.
+fn sparse_linear_seq(sl: &SparseLayer, h: &[f32], act: Activation, opts: SparseOptions) -> Vec<f32> {
     let in_dim = sl.in_dim;
     let out_dim = sl.out_dim;
     let mut out = vec![0.0f32; h.len() / in_dim * out_dim];
-    let idx = MipsIndex::new(&sl.experts);
+    // Build the index backend once for the layer (HNSW build is amortized over
+    // all positions in the sequence).
+    let hnsw = match opts.index {
+        nse_rie::IndexKind::Hnsw => Some(nse_rie::build_hnsw_for_layer(sl)),
+        nse_rie::IndexKind::Brute => None,
+    };
+    let brute = nse_rie::MipsIndex::new(&sl.experts);
     for t in 0..(h.len() / in_dim) {
         let x = &h[t * in_dim..(t + 1) * in_dim];
+        // Query the chosen backend for all hits (sorted descending).
+        let hits: Vec<nse_rie::Hit> = match &hnsw {
+            Some(hi) => nse_rie::MipsQuery::query_all(hi, x),
+            None => nse_rie::MipsQuery::query_all(&brute, x),
+        };
         let activated = match act {
-            Activation::All => {
-                let hits = idx.query_all(x);
-                route_all(&hits)
-            }
+            Activation::All => route_all(&hits),
             Activation::Threshold { ratio, max_k } => {
-                let hits = idx.query_all(x);
                 route_by_ratio(&hits, &RouterConfig { threshold_ratio: ratio, max_k })
             }
         };
         let ids: Vec<usize> = activated.iter().map(|h| h.expert_id).collect();
-        let y = sparse_linear(sl, x, &ids);
+        let y = nse_rie::sparse_linear_with_kernel(sl, x, &ids, opts.kernel);
         out[t * out_dim..(t + 1) * out_dim].copy_from_slice(&y);
     }
     out
