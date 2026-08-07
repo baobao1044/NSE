@@ -1,24 +1,24 @@
 //! Static bias compensator.
 //!
-//! When micro-experts are pruned, the expected value of the skipped branches
-//! is precomputed into a fixed vector `B_sparse ∈ R^{d_out}` and added back to
-//! the output, restoring ~99.9% of the dense model's accuracy.
+//! Re-exports the LLER bias-apply kernel and provides a thin helper to apply
+//! the [`nse_core::sparse::SparseLayer`] bias to an output vector. The bias
+//! `B[i] = W[i] . mean_input` is precomputed by ZSTM for every output row;
+//! the bias is added unconditionally to the sparse output, restoring the
+//! expected contribution of pruned experts on average.
 //!
-//! Status: skeleton (M0). Real compensator lands in M4.
+//! Core rows have `B[i] = 0` (they're computed exactly by the dense path), so
+//! adding the full bias never double-counts the core.
 
-/// A precomputed bias vector added to the sparse output.
-#[derive(Debug, Clone)]
-pub struct BiasCompensator {
-    pub bias: Vec<f32>,
+pub use nse_ller::apply_bias as apply_bias_kernel;
+
+use nse_core::sparse::SparseLayer;
+
+/// Add `sl.bias` to `output` in place (full bias for every output row).
+pub fn apply(layer_bias: &[f32], output: &mut [f32]) {
+    apply_bias_kernel(layer_bias, output);
 }
 
-impl BiasCompensator {
-    pub fn new(d_out: usize) -> Self {
-        Self { bias: vec![0.0; d_out] }
-    }
-
-    /// Add the bias to `output` in place. (Stub — M4 will compute real bias.)
-    pub fn apply(&self, _output: &mut [f32]) {
-        todo!("M4: bias compensation")
-    }
+/// Convenience: apply a [`SparseLayer`]'s bias.
+pub fn apply_layer(sl: &SparseLayer, output: &mut [f32]) {
+    apply_bias_kernel(&sl.bias, output);
 }

@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 nse-core.workspace = true
+nse-ller.workspace = true
 ndarray.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
