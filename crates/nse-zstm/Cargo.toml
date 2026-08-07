@@ -14,5 +14,9 @@ ndarray-rand.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

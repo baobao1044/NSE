@@ -7,7 +7,7 @@
 use crate::error::{NseError, NseResult};
 
 /// Owned row-major `f32` matrix of shape `[rows, cols]`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
