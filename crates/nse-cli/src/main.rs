@@ -10,10 +10,6 @@
 //! nse eval sparse -> PPL_sparse          (RIE + LLER scalar + bias)
 //! nse eval compare -> report             (PPL_dense | PPL_sparse | % drop)
 //! ```
-//!
-//! Status: skeleton (M0). Subcommands wired up in M5.
-
-#![allow(dead_code)]
 
 mod cli;
 

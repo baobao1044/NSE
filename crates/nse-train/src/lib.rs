@@ -23,5 +23,5 @@ pub mod forward_forward;
 pub mod hopfield;
 pub mod lsh_sparse;
 
-pub use sgd::SgdTrainer;
+pub use sgd::{SgdConfig, SgdTrainer};
 pub use trainer::Trainer;

@@ -15,7 +15,7 @@ use nse_core::sparse::{
     ConfigStub, MicroExpert, SparseLayer, TransmutedModel,
 };
 use nse_core::tensor::Matrix;
-use nse_models::{Config, ToyLm, forward_cached};
+use nse_models::{ToyLm, forward_cached};
 
 use crate::cluster::{cluster, ClusterConfig};
 use crate::outlier::{extract, OutlierConfig};
@@ -243,6 +243,7 @@ pub fn load_transmuted(path: impl AsRef<Path>) -> anyhow::Result<TransmutedModel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nse_models::Config;
 
     #[test]
     fn transmute_covers_all_rows() {

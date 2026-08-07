@@ -14,3 +14,7 @@ nse-ller.workspace = true
 ndarray.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+nse-zstm.workspace = true
+tempfile = "3"

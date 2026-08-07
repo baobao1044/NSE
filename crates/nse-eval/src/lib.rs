@@ -1,14 +1,21 @@
 //! # nse-eval
 //!
-//! Perplexity evaluation and dense-vs-sparse comparison.
+//! Perplexity evaluation and dense-vs-sparse comparison — the headline metric
+//! of the NSE POC.
 //!
-//! Computes language-model perplexity (PPL) for both the dense source model and
-//! the transmuted sparse NSE model over the same corpus, then reports the
-//! relative PPL degradation — the headline metric of the NSE POC.
-//!
-//! Status: skeleton (M0). PPL runners + comparison report land in M5.
+//! - `sparse_forward`: the sparse forward pass over a [`TransmutedModel`],
+//!   mirroring the dense forward but with matmuls replaced by sparse linears.
+//! - `ppl`: perplexity for both the dense [`nse_models::ToyLm`] and the
+//!   sparse [`nse_core::TransmutedModel`], over the same sliding windows.
+//! - `compare`: runs both and produces a [`CompareReport`] with `PPL_dense`,
+//!   `PPL_sparse`, the relative degradation, and the active-fraction.
 
 #![allow(dead_code)]
 
-pub mod ppl;
 pub mod compare;
+pub mod ppl;
+pub mod sparse_forward;
+
+pub use compare::{compare, CompareReport};
+pub use ppl::{dense_ppl, sparse_ppl, perplexity_from_logprobs, logprobs};
+pub use sparse_forward::{sparse_forward, Activation};
