@@ -20,6 +20,7 @@
 #![allow(dead_code)]
 
 pub mod bias;
+pub mod hnsw;
 pub mod index;
 pub mod router;
 

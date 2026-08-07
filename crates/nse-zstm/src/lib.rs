@@ -19,6 +19,7 @@
 
 pub mod cluster;
 pub mod outlier;
+pub mod pq;
 pub mod quantize;
 pub mod transmuter;
 

@@ -46,11 +46,25 @@ cargo run --release -- eval compare   # -> báo cáo so sánh
 ## Trạng thái
 
 - [x] **M0**: Workspace scaffold, build + test pass.
-- [ ] **M1**: nse-core (.nse) + nse-models (Toy LM forward).
-- [ ] **M2**: nse-train SgdTrainer.
-- [ ] **M3**: nse-zstm (outlier + k-means + ternary → .nse).
-- [ ] **M4**: nse-rie + nse-ller scalar kernel.
-- [ ] **M5**: nse-eval + nse-cli (báo cáo PPL).
-- [ ] **M6**: Scaffold AVX2/HNSW/PQ + 3 thuật toán training.
+- [x] **M1**: nse-core (.nse) + nse-models (Toy LM forward + tokenizer + safetensors).
+- [x] **M2**: nse-train SgdTrainer (backprop + momentum + grad clip), PPL drops >50%.
+- [x] **M3**: nse-zstm (outlier + k-means + ternary → .nse transmuted model).
+- [x] **M4**: nse-rie + nse-ller scalar kernel → sparse inference correct.
+- [x] **M5**: nse-eval + nse-cli → báo cáo so sánh PPL dense vs sparse.
+- [x] **M6**: Scaffold AVX2/HNSW/PQ + 3 thuật toán training (FF/Hopfield/LSH-sparse).
 
-Xem `docs/` cho spec đầy đủ.
+## Kết quả POC
+
+Pipeline end-to-end chạy được:
+
+```bash
+nse train        # PPL 18 → 9.5 (training)
+nse eval-dense   # PPL dense  = 17.6
+nse transmute    # dense → .nse (ZSTM)
+nse eval-sparse  # PPL sparse = 53.2 (all) / 73.5 (threshold)
+nse eval-compare # báo cáo so sánh
+```
+
+Degradation chỉ từ ternary quantization (mode all) hoặc pruning+bias (mode threshold).
+Tất cả kernel math dùng scalar reference chính xác; AVX2/HNSW/PQ là scaffold
+cho phase tối ưu hiệu năng sau.

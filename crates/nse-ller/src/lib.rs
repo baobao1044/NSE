@@ -13,6 +13,7 @@
 
 #![allow(dead_code)]
 
+pub mod avx2;
 pub mod kernel;
 pub mod tiling;
 
