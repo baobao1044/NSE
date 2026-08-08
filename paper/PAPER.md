@@ -251,6 +251,77 @@ FP noise). AVX2 match vô hướng, HNSW match brute (recall=1 trên đồ thị
 - Hopfield retrieval khớp value + PPL hữu hạn
 - ZSTM roundtrip, RIE routing, định dạng .nse
 
+### 5.4 Phân tích failure mode: FF vs Hopfield
+
+Số liệu 5.1 cho thấy FF (PPL 27.35) đánh bại baseline đồng nhất (38) nhưng kém
+SGD (20.50), còn Hopfield (53.18) thậm chí kém baseline. Câu hỏi quan trọng:
+đó là **thiếu năng lực** của thuật toán, hay một **lỗi có thể sửa**? Để phân
+biệt, chúng ta sweep tham số ổn định của từng trainer và xem PPL có cải thiện
+thêm hay chỉ "đứng yên ở mức ổn định".
+
+**FF — sweep `weight_clip`** (max-norm clamp, 30 epochs):
+
+| clip | G_pos | G_neg | margin (G_pos−G_neg) | G_neg/G_pos | PPL |
+|----:|------:|------:|--------------------:|------------:|----:|
+| 0.2 | 3.34 | 3.31 | 0.035 | 0.990 | 32.19 |
+| **0.5** | 1.74 | 1.71 | **0.027** | **0.985** | **27.35** |
+| 0.7 | 1.89 | 1.89 | 0.001 | 1.000 | 28.73 |
+| 1.0 | 1.67 | 1.67 | 0.002 | 0.999 | 30.50 |
+| 2.0 | 23.20 | 23.20 | 0.0001 | 1.0000 | 32.20 |
+| 3.0 | 3186.7 | 2958.5 | 228.1 | 0.928 | 20548.6 |
+
+Đường cong PPL theo `weight_clip` có **dạng U rõ ràng**, cực tiểu tại 0.5. Đây
+là dấu hiệu của một hệ có **tín hiệu học thật**: quá chặt (0.2) → underfit, quá
+lỏng (≥1.0) → exploit, vừa đủ (0.5) → học được. Quan sát chìa khóa: khi clip lỏng,
+G_pos và G_neg **tăng cùng nhau theo cấp số nhân** (1.67 → 23 → 3186) nhưng
+margin (G_pos−G_neg) **suy giảm về ~0** (0.0001 tại clip=2.0, ratio 1.0000). Tức
+là mạng đang **"hét to" cả positive lẫn negative** thay vì *tách* chúng — nó
+hack objective `softplus(θ−G_pos)+softplus(G_neg−θ)` bằng cách đẩy cả hai G ra xa
+θ, không phải bằng cách làm G_pos > G_neg. Clip chặn exploit này, lộ năng lực
+học thật (PPL 27.35). Khoảng cách tới SGD (20.50) ≈ 33% — chưa thắng, nhưng
+**hoàn toàn không phải "FF vô dụng"**.
+
+Điều này gợi ý FF nguyên bản thiếu cơ chế sinh học: neuron được "tự quyết định
+goodness" nhưng không có giới hạn mức năng lượng — clip đóng vai trò **ức chế
+sinh học / homeostasis**. FF có thể hợp với sparse training: điểm yếu backprop
+trong sparse setting là weight inactive → gradient không tới, trong khi FF tự
+đánh giá goodness cục bộ không cần gradient toàn cục — nhưng cần thêm
+normalization/bounded activation để tránh tự kích hoạt.
+
+**Hopfield — sweep `value_scale`** (num_writes=64):
+
+| value_scale | PPL |
+|---:|---:|
+| 0.05 | 63.62 |
+| 0.1 | 62.40 |
+| 0.3 | 59.70 |
+| 0.5 | 58.90 |
+
+PPL giảm nhẹ theo value_scale (63.62 → 58.90) nhưng **đơn điệu, không có sweet
+spot**, và **mọi giá trị đều > baseline đồng nhất (38)**. Đây là pattern rất
+khác FF: không có cực tiểu → không có "lộ năng lực" khi nới tham số. Vấn đề
+không phải "value quá lớn" mà là **retrieval mechanism sai loại** — Hopfield
+hiện đại cần `query → similarity → normalized retrieval (softmax) → value
+mixture`, nhưng dense eval dùng `raw activation → GELU → value injection`, thiếu
+cạnh tranh giữa các ký ức và xác suất retrieval. value_scale chỉ nudge biên độ
+residual, không sửa được sự không tương thích căn bản này. **Hopfield cần
+forward-path riêng** (thay GELU bằng softmax retrieval trong forward) mới có khả
+năng cải thiện PPL — đây là giới hạn kiến trúc, không phải tuning.
+
+**Phân biệt hai loại failure**: phân tích này tách rõ hai failure mode rất khác:
+(i) FF = **vấn đề objective/optimization** → đã cứu được một phần bằng ức chế
+sinh học (clip); (ii) Hopfield = **mismatch kiến trúc** → cần thay đổi nguyên
+lý, không phải tham số. Cái nhìn này có giá trị khoa học hơn vài điểm PPL: nó
+chỉ ra rằng "local learning không đủ mạnh" chưa phải kết luận — đúng hơn là
+"local learning cần cơ chế chống tự kích hoạt".
+
+**Gợi ý kiến trúc tổng hợp**: thay vì ép Hopfield thành trainer, NSE có thể đi
+theo phân vai trò giống thần kinh học (routing/learning/memory tách rời như
+basal ganglia / cortex / hippocampus): `token → Hopfield retrieval (normalized,
+chọn ký ức) → LSH route (tìm nhanh) → FF learning (học pathway, có clip) →
+sparse update`. SGD giữ vai trò pretraining stabilizer. Đây là hướng mở, chưa
+triển khai.
+
 ---
 
 ## 6. Giới hạn & thảo luận trung thành

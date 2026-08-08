@@ -17,3 +17,4 @@ Thumbs.db
 *.safetensors
 *.pt
 *.pth
+data/sweep/
