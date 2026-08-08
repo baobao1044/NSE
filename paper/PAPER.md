@@ -387,6 +387,39 @@ chọn ký ức) → LSH route (tìm nhanh) → FF learning (học pathway, có 
 sparse update`. SGD giữ vai trò pretraining stabilizer. Đây là hướng mở, chưa
 triển khai.
 
+### 5.5 Benchmark throughput
+
+Trước đây NSE verify **correctness** (AVX2 = vô hướng, HNSW = brute). Giá trị
+thật nằm ở **throughput**. Hai benchmark (`cargo run --release --example
+bench_avx2 -p nse-lier`, `bench_hnsw -p nse-rie`):
+
+#### AVX2 vs vô hướng (kernel)
+
+| Kernel | vô hướng | AVX2 | speedup |
+|---|---:|---:|---:|
+| Ternary micro-expert (1024 rows × 256 in) | 496 µs (1.06 GFLOP/s) | 355 µs (1.47 GFLOP/s) | 1.40× |
+| Dense core (512 rows × 256 in) | 384 µs (0.68 GFLOP/s) | 53 µs (4.92 GFLOP/s) | **7.21×** |
+
+Dense core hưởng FMA đầy đủ (7.2×); ternary chỉ 1.4× vì mask/blend overhead
+lớn hơn FMA saving. Cả hai chạy đúng (5.2 đã verify correctness); giá trị
+throughput này là trên toy-size matrices — matrix lớn hơn sẽ cho speedup cao hơn
+(AVX2 width cố định 8 floats, overhead chia đều).
+
+#### HNSW vs brute-force (query latency)
+
+| n experts | brute (µs/q) | HNSW (µs/q) | speedup | recall@10 |
+|---:|---:|---:|---:|---:|
+| 1,000 | 205 | 669 | 0.31× | 0.993 |
+| 5,000 | 1,214 | 1,229 | 0.99× | 0.868 |
+| 20,000 | 4,925 | **2,144** | **2.30×** | 0.547 |
+
+HNSW **chậm hơn** brute ở N nhỏ (graph overhead > saving), break-even ~5,000,
+rồi vượt brute rõ (2.3× tại 20k). Recall **giảm** khi N tăng (0.99→0.55) — đây
+là tradeoff thật của HNSW xấp xỉ, không phải bug; brute O(N) thắng ở N nhỏ và
+cho recall 1.0. `ef_search` cao hơn sẽ tăng recall giảm speedup. Đây là dữ liệu
+trung thực: HNSW chỉ có giá trị ở quy mô lớn, đúng như giới hạn đã tài liệu hóa
+trong 5.2/6.
+
 ---
 
 ## 6. Giới hạn & thảo luận trung thành

@@ -13,3 +13,6 @@ ndarray.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
