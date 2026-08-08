@@ -124,6 +124,10 @@ enum Cmd {
         corpus: PathBuf,
         #[arg(long, default_value = "toy_lm_lsh.safetensors")]
         out: PathBuf,
+        /// Optional warm-start: load this model instead of random init (e.g. a
+        /// Forward-Forward-trained model) then fine-tune with LSH-sparse updates.
+        #[arg(long)]
+        init: Option<PathBuf>,
         #[arg(long, default_value_t = 32)]
         dim: usize,
         #[arg(long, default_value_t = 2)]
@@ -294,20 +298,25 @@ pub fn run() -> Result<()> {
             eprintln!("Saved Hopfield-trained model to {}", out.display());
             Ok(())
         }
-        Cmd::TrainLsh { corpus, out, dim, layers, heads, seq_len, ff_dim, epochs, lr, sparse_fraction } => {
+        Cmd::TrainLsh { corpus, out, init, dim, layers, heads, seq_len, ff_dim, epochs, lr, sparse_fraction } => {
             let corpus_bytes = std::fs::read(&corpus)
                 .with_context(|| format!("reading corpus {}", corpus.display()))?;
             let tok = Tokenizer::from_corpus(&corpus_bytes);
-            let cfg = Config {
-                vocab_size: tok.vocab_size,
-                dim,
-                num_layers: layers,
-                num_heads: heads,
-                max_seq_len: seq_len,
-                ff_dim,
+            let mut lm = if let Some(p) = &init {
+                eprintln!("LSH-sparse: warm-starting from {}", p.display());
+                nse_models::loader::load_toy_lm(p)?
+            } else {
+                let cfg = Config {
+                    vocab_size: tok.vocab_size,
+                    dim,
+                    num_layers: layers,
+                    num_heads: heads,
+                    max_seq_len: seq_len,
+                    ff_dim,
+                };
+                ToyLm::init_random(cfg, 1337)
             };
-            let mut lm = ToyLm::init_random(cfg.clone(), 1337);
-            eprintln!("Training Toy LM (LSH-sparse): dense backprop + per-row LSH grad mask");
+            eprintln!("Training Toy LM (LSH-sparse): dense backprop + per-row LSH grad mask{}", if init.is_some() { " [warm-start]" } else { "" });
             let mut trainer = LshSparseTrainer::new(LshSparseConfig {
                 learning_rate: lr,
                 seq_len,
