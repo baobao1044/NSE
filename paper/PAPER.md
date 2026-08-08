@@ -288,6 +288,26 @@ trong sparse setting là weight inactive → gradient không tới, trong khi FF
 đánh giá goodness cục bộ không cần gradient toàn cục — nhưng cần thêm
 normalization/bounded activation để tránh tự kích hoạt.
 
+#### 5.4.1 LayerNorm homeostasis — một negative result có ý nghĩa
+
+Câu hỏi tự nhiên: clip cố định là "phanh tay"; não có **homeostasis tự thích ứng**
+(firing-rate / synaptic scaling). Có thể thay clip bằng chuẩn hóa goodness?
+Chúng ta thử variant `Homeostasis::LayerNorm`: `Ĝ = (G − run_mean)/(run_std + ε)`,
+θ = run_mean (EMA Welford) — chuẩn hóa G trước softplus để objective thưởng
+*separation* (G_pos trên chuẩn, G_neg dưới) thay vì magnitude.
+
+Kết quả: **LayerNorm fail** — G_pos ≈ G_neg ở mọi epoch (ratio 1.0000), mạng
+không học phân tách. Lý do rõ ràng: khi cả G_pos và G_neg cùng được chuẩn hóa
+chống cùng running stats, hai gradient của softplus `(0−Ĝ_pos)` và `(Ĝ_neg−0)`
+trở nên **đối xứng và triệt tiêu** — mạng không nhận được signal *hướng*
+(pos vs neg). Đây là rủi ro của chuẩn hóa mất thông tin hướng, đúng cảnh báo.
+Insight: **homeostasis phải giữ hướng (pos vs neg), không chỉ rescale
+magnitude**. Clip giữ hướng (chỉ chặn magnitude) nên work; LayerNorm mất hướng
+nên fail. Hướng đúng là percentile θ (θ = percentile cao của G_pos history,
+không chuẩn hóa G) — giữ hướng + ngăn phình, nhưng cần history buffer, để
+Phase tiếp theo. Variant `LayerNorm` giữ lại trong code (`--homeostasis
+layernorm`) để reproduce negative result này.
+
 **Hopfield — sweep `value_scale`** (num_writes=64):
 
 | value_scale | PPL |

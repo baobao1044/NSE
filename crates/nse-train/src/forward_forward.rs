@@ -55,6 +55,41 @@ use rand::{rngs::StdRng, SeedableRng};
 use crate::sgd_apply::apply_step;
 use crate::Trainer;
 
+/// Goodness normalization scheme (FF homeostasis). The raw FF objective
+/// `softplus(θ−G_pos)+softplus(G_neg−θ)` has no box constraint and rewards
+/// inflating energy magnitude (both G_pos and G_neg grow together → ratio →1,
+/// see 5.4). Homeostasis normalizes G before the softplus so the objective
+/// rewards *separation* (G_pos above the norm, G_neg below), not raw magnitude
+/// — biologically, this is firing-rate / synaptic scaling: a neuron can win
+/// by being more selective, not by shouting louder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Homeostasis {
+    /// No normalization (raw `G = mean(y²)`). Needs `weight_clip` to stay stable.
+    None,
+    /// LayerNorm-style: `Ĝ = (G − run_mean) / (run_std + ε)`, with running
+    /// mean/std tracked by EMA over training steps. θ tracks `run_mean` so the
+    /// softplus threshold is where "typical" goodness sits. Preserves the
+    /// *shape* of G (which block is more active) while removing the incentive
+    /// to inflate magnitude.
+    LayerNorm,
+}
+
+impl Default for Homeostasis {
+    fn default() -> Self {
+        // Default to None (raw G + weight_clip): the U-curve analysis (5.4)
+        // showed raw FF with a tuned weight_clip (0.5) reaches PPL 27.35.
+        // LayerNorm-style Ĝ=(G−run_mean)/run_std was tried but *fails*: when
+        // both G_pos and G_neg are standardized against the same running
+        // stats, their softplus gradients (−sigmoid(−Ĝ_pos), +sigmoid(Ĝ_neg))
+        // become symmetric and cancel — the network gets no signal to
+        // *separate* positives from negatives (G_pos≈G_neg, ratio→1). This
+        // is itself a useful finding: homeostasis must preserve the
+        // *direction* (pos vs neg), not just rescale magnitude. LayerNorm
+        // remains selectable for reproducibility of that experiment.
+        Homeostasis::None
+    }
+}
+
 /// Hyperparameters for the Forward-Forward trainer.
 #[derive(Debug, Clone)]
 pub struct ForwardForwardConfig {
@@ -75,8 +110,10 @@ pub struct ForwardForwardConfig {
     /// Per-weight max-norm clamp applied after each step (stabilizes FF: the
     /// local goodness objective has no box constraint and otherwise lets block
     /// energy grow unbounded → residual stream blows up → NaN logits). 0
-    /// disables the clamp.
+    /// disables the clamp. Less needed when `homeostasis = LayerNorm`.
     pub weight_clip: f32,
+    /// Goodness normalization (homeostasis). See [`Homeostasis`].
+    pub homeostasis: Homeostasis,
     pub log_every: usize,
     pub seed: u64,
 }
@@ -93,6 +130,7 @@ impl Default for ForwardForwardConfig {
             hebbian_embed_lr: 0.01,
             theta_ema: 0.99,
             weight_clip: 1.0,
+            homeostasis: Homeostasis::default(),
             log_every: 0,
             seed: 5,
         }
@@ -103,8 +141,13 @@ impl Default for ForwardForwardConfig {
 pub struct ForwardForwardTrainer {
     pub config: ForwardForwardConfig,
     vel: Option<ToyLmGrads>,
-    /// Per-block goodness threshold θ (EMA of positive goodness).
+    /// Per-block goodness threshold θ (EMA of positive goodness, or the
+    /// running mean when `homeostasis = LayerNorm`).
     theta: Vec<f32>,
+    /// Per-block running mean of G (for LayerNorm homeostasis).
+    g_mean: Vec<f32>,
+    /// Per-block running variance of G (for LayerNorm homeostasis).
+    g_var: Vec<f32>,
 }
 
 impl ForwardForwardTrainer {
@@ -113,6 +156,8 @@ impl ForwardForwardTrainer {
             config,
             vel: None,
             theta: Vec::new(),
+            g_mean: Vec::new(),
+            g_var: Vec::new(),
         }
     }
 }
@@ -164,11 +209,18 @@ impl Trainer for ForwardForwardTrainer {
             let first: Vec<u32> = ids[0..seq].to_vec();
             let (cache0, _) = forward_cached(model, &first);
             let mut th = Vec::with_capacity(n_layers);
+            let mut gm = Vec::with_capacity(n_layers);
+            let mut gv = Vec::with_capacity(n_layers);
             for l in 0..n_layers {
                 let y = layer_output(&cache0.layers[l], seq, d);
-                th.push(goodness(&y));
+                let g = goodness(&y);
+                th.push(g);
+                gm.push(g);
+                gv.push(0.0); // variance unknown from a single sample
             }
             self.theta = th;
+            self.g_mean = gm;
+            self.g_var = gv;
         }
 
         for epoch in 0..epochs {
@@ -188,14 +240,43 @@ impl Trainer for ForwardForwardTrainer {
                 for l in 0..n_layers {
                     let y_pos = layer_output(&cache_pos.layers[l], seq, d);
                     let y_neg = layer_output(&cache_neg.layers[l], seq, d);
-                    let g_pos = goodness(&y_pos);
-                    let g_neg = goodness(&y_neg);
-                    let theta = self.theta[l];
+                    let g_pos_raw = goodness(&y_pos);
+                    let g_neg_raw = goodness(&y_neg);
+
+                    // Homeostasis: normalize G before the softplus. Raw mode
+                    // uses G directly (needs weight_clip). LayerNorm mode
+                    // standardizes G to Ĝ = (G − run_mean)/(run_std + ε), and θ
+                    // tracks run_mean — so the softplus rewards G_pos being
+                    // *above the norm* and G_neg *below*, not raw magnitude.
+                    let (g_pos, g_neg, theta) = match cfg.homeostasis {
+                        Homeostasis::None => (g_pos_raw, g_neg_raw, self.theta[l]),
+                        Homeostasis::LayerNorm => {
+                            let m = self.g_mean[l];
+                            let s = (self.g_var[l].max(0.0) + 1e-6).sqrt();
+                            let gp = (g_pos_raw - m) / s;
+                            let gn = (g_neg_raw - m) / s;
+                            // θ sits at the running mean (Ĝ = 0 there).
+                            (gp, gn, 0.0)
+                        }
+                    };
 
                     // Loss = softplus(θ − G_pos) + softplus(G_neg − θ).
                     // dL/dW = −sigmoid(θ−G_pos)·dG_pos/dW + sigmoid(G_neg−θ)·dG_neg/dW
-                    let coeff_pos = -sigmoid(theta - g_pos);
-                    let coeff_neg = sigmoid(g_neg - theta);
+                    // For LayerNorm, dĜ/dG = 1/s (the std is treated as constant
+                    // over one step), so we fold 1/s into coeff.
+                    let (coeff_pos, coeff_neg) = match cfg.homeostasis {
+                        Homeostasis::None => (
+                            -sigmoid(theta - g_pos),
+                            sigmoid(g_neg - theta),
+                        ),
+                        Homeostasis::LayerNorm => {
+                            let s = (self.g_var[l].max(0.0) + 1e-6).sqrt();
+                            (
+                                -sigmoid(theta - g_pos) / s,
+                                sigmoid(g_neg - theta) / s,
+                            )
+                        }
+                    };
 
                     // dG/dy = (2/N) · y
                     let n = (seq * d) as f32;
@@ -205,13 +286,30 @@ impl Trainer for ForwardForwardTrainer {
                     block_backward_local(model, &cache_pos, l, &dy_pos, coeff_pos, &mut grads);
                     block_backward_local(model, &cache_neg, l, &dy_neg, coeff_neg, &mut grads);
 
-                    g_pos_sum += g_pos;
-                    g_neg_sum += g_neg;
+                    g_pos_sum += g_pos_raw;
+                    g_neg_sum += g_neg_raw;
 
-                    // EMA update of θ toward the positive goodness so the
-                    // softplus threshold tracks the block's energy level.
-                    self.theta[l] =
-                        cfg.theta_ema * self.theta[l] + (1.0 - cfg.theta_ema) * g_pos;
+                    // Update running stats (EMA) and θ.
+                    match cfg.homeostasis {
+                        Homeostasis::None => {
+                            self.theta[l] = cfg.theta_ema * self.theta[l]
+                                + (1.0 - cfg.theta_ema) * g_pos_raw;
+                        }
+                        Homeostasis::LayerNorm => {
+                            // EMA of mean and var (Welford-style) over the
+                            // positive pass — a sample of the block's goodness.
+                            let ema = cfg.theta_ema;
+                            let g = g_pos_raw;
+                            let old_m = self.g_mean[l];
+                            let new_m = ema * old_m + (1.0 - ema) * g;
+                            let delta = g - old_m;
+                            let new_v = ema * self.g_var[l]
+                                + (1.0 - ema) * delta * (g - new_m);
+                            self.g_mean[l] = new_m;
+                            self.g_var[l] = new_v;
+                            self.theta[l] = new_m;
+                        }
+                    }
                 }
 
                 apply_step(model, &grads, vel, lr, cfg.momentum, cfg.max_grad_norm);

@@ -87,6 +87,10 @@ enum Cmd {
         /// Per-weight max-norm clamp (FF stabilization; 0 disables).
         #[arg(long, default_value_t = 1.0)]
         weight_clip: f32,
+        /// Goodness normalization (FF homeostasis): "none" (raw G, needs weight_clip)
+        /// or "layernorm" (standardize G — experimentally fails, kept for repro).
+        #[arg(long, default_value = "none")]
+        homeostasis: String,
     },
     /// Train the Toy LM by writing associative memories into the FFN
     /// (modern Hopfield, one-shot writes, no backprop). Research prototype.
@@ -229,7 +233,7 @@ pub fn run() -> Result<()> {
             eprintln!("Saved trained model to {}", out.display());
             Ok(())
         }
-        Cmd::TrainFf { corpus, out, dim, layers, heads, seq_len, ff_dim, epochs, lr, hebb_lr, weight_clip } => {
+        Cmd::TrainFf { corpus, out, dim, layers, heads, seq_len, ff_dim, epochs, lr, hebb_lr, weight_clip, homeostasis } => {
             let corpus_bytes = std::fs::read(&corpus)
                 .with_context(|| format!("reading corpus {}", corpus.display()))?;
             let tok = Tokenizer::from_corpus(&corpus_bytes);
@@ -242,13 +246,19 @@ pub fn run() -> Result<()> {
                 ff_dim,
             };
             let mut lm = ToyLm::init_random(cfg.clone(), 1337);
-            eprintln!("Training Toy LM (Forward-Forward): local goodness, no global backprop, weight_clip={weight_clip}");
+            let homeo = match homeostasis.to_ascii_lowercase().as_str() {
+                "none" => nse_train::Homeostasis::None,
+                "layernorm" => nse_train::Homeostasis::LayerNorm,
+                _ => anyhow::bail!("invalid --homeostasis '{homeostasis}': expected none|layernorm"),
+            };
+            eprintln!("Training Toy LM (Forward-Forward): homeostasis={homeostasis}, weight_clip={weight_clip}");
             let mut trainer = ForwardForwardTrainer::new(ForwardForwardConfig {
                 learning_rate: lr,
                 seq_len,
                 epochs,
                 hebbian_embed_lr: hebb_lr,
                 weight_clip,
+                homeostasis: homeo,
                 log_every: 10,
                 ..Default::default()
             });

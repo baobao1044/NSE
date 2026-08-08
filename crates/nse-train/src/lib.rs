@@ -32,7 +32,7 @@ pub mod lsh;
 pub mod lsh_sparse;
 
 pub use sgd::{SgdConfig, SgdTrainer};
-pub use forward_forward::{ForwardForwardConfig, ForwardForwardTrainer};
+pub use forward_forward::{ForwardForwardConfig, ForwardForwardTrainer, Homeostasis};
 pub use hopfield::{HopfieldConfig, HopfieldTrainer, hopfield_retrieve};
 pub use lsh_sparse::{LshSparseConfig, LshSparseTrainer};
 pub use trainer::Trainer;
