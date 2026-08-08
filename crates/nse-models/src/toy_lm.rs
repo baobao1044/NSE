@@ -151,6 +151,94 @@ impl ToyLm {
         }
         logits
     }
+
+    /// Forward pass with the FFN replaced by a **Hopfield retrieval** rule:
+    /// instead of `gelu(h2 @ ff_up) @ ff_down`, the FFN output is
+    /// `ff_down · softmax(β · (ff_up · h2))` per position. This is the forward
+    /// path the Hopfield trainer's writes were *designed* for (modern Hopfield
+    /// retrieval); the standard [`forward`](Self::forward) uses GELU and so
+    /// does not exercise the associative memory. `beta` is the retrieval
+    /// sharpness. Used to test the architecture-mismatch hypothesis.
+    pub fn forward_hopfield(&self, tokens: &[u32], beta: f32) -> Vec<f32> {
+        let c = &self.config;
+        let seq = tokens.len();
+        let d = c.dim;
+        let v = c.vocab_size;
+        let fd = c.ff_dim;
+
+        let mut x = vec![0.0f32; seq * d];
+        for (t, &tok) in tokens.iter().enumerate() {
+            let tok = (tok as usize).min(v - 1);
+            for j in 0..d {
+                x[t * d + j] = self.weights.token_embed.data[tok * d + j];
+            }
+        }
+
+        for layer in 0..c.num_layers {
+            let ln1 = &self.weights.ln1_gain[layer];
+            let qkv = &self.weights.qkv[layer];
+            let attn_out = &self.weights.attn_out[layer];
+            let ln2 = &self.weights.ln2_gain[layer];
+            let ff_up = &self.weights.ff_up[layer];
+            let ff_down = &self.weights.ff_down[layer];
+
+            // --- Attention (identical to forward) ---
+            let h = layernorm(&x, seq, d, ln1);
+            let qkv_out = matmul_rows(&h, qkv);
+            let (q, k, vp) = split_qkv(&qkv_out, seq, d);
+            let attn = causal_self_attention(&q, &k, &vp, seq, d, c.num_heads);
+            let attn_out_proj = matmul_rows(&attn, attn_out);
+            for i in 0..seq * d {
+                x[i] += attn_out_proj[i];
+            }
+
+            // --- FFN: Hopfield retrieval (softmax) instead of GELU ---
+            let h2 = layernorm(&x, seq, d, ln2); // [seq, dim] — the query
+            // scores[i] = ff_up[i,:] · h2[t,:], i in 0..ff_dim
+            let mut scores = vec![0.0f32; fd];
+            for t in 0..seq {
+                for i in 0..fd {
+                    let mut s = 0.0;
+                    for j in 0..d {
+                        s += ff_up.data[i * d + j] * h2[t * d + j];
+                    }
+                    scores[i] = beta * s;
+                }
+                // softmax over slots
+                let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for s in scores.iter_mut() {
+                    *s = (*s - max).exp();
+                    sum += *s;
+                }
+                let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+                for s in scores.iter_mut() {
+                    *s *= inv;
+                }
+                // down[t,j] = sum_i ff_down[j,i] * softmax_i
+                for j in 0..d {
+                    let mut acc = 0.0;
+                    for i in 0..fd {
+                        acc += ff_down.data[j * fd + i] * scores[i];
+                    }
+                    x[t * d + j] += acc;
+                }
+            }
+        }
+
+        let x = layernorm(&x, seq, d, &self.weights.ln_f_gain);
+        let mut logits = vec![0.0f32; seq * v];
+        for t in 0..seq {
+            for w in 0..v {
+                let mut s = 0.0;
+                for j in 0..d {
+                    s += x[t * d + j] * self.weights.token_embed.data[w * d + j];
+                }
+                logits[t * v + w] = s;
+            }
+        }
+        logits
+    }
 }
 
 /// LayerNorm without bias: `y = gain * (x - mean) / sqrt(var + eps)`.
