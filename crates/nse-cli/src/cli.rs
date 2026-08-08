@@ -153,6 +153,14 @@ enum Cmd {
         model: PathBuf,
         #[arg(long, default_value_t = 16)]
         seq_len: usize,
+        /// FFN forward path: "gelu" (standard) or "hopfield" (softmax retrieval).
+        /// Tests whether a Hopfield-trained model does better under the
+        /// retrieval path it was designed for (architecture-mismatch test).
+        #[arg(long, default_value = "gelu")]
+        forward: String,
+        /// Retrieval sharpness β (only used with --forward hopfield).
+        #[arg(long, default_value_t = 8.0)]
+        beta: f32,
     },
     /// Transmute a trained model into the sparse NSE format (.nse JSON).
     Transmute {
@@ -330,13 +338,17 @@ pub fn run() -> Result<()> {
             eprintln!("Saved LSH-trained model to {}", out.display());
             Ok(())
         }
-        Cmd::EvalDense { corpus, model, seq_len } => {
+        Cmd::EvalDense { corpus, model, seq_len, forward, beta } => {
             let corpus_bytes = std::fs::read(&corpus)?;
             let lm = nse_models::loader::load_toy_lm(&model)?;
             let tok = Tokenizer::from_corpus(&corpus_bytes);
             let ids = tok.encode(&corpus_bytes);
-            let ppl = dense_ppl(&lm, &ids, seq_len);
-            println!("PPL (dense): {:.4}", ppl);
+            let ppl = match forward.to_ascii_lowercase().as_str() {
+                "gelu" => dense_ppl(&lm, &ids, seq_len),
+                "hopfield" => nse_eval::dense_ppl_hopfield(&lm, &ids, seq_len, beta),
+                _ => anyhow::bail!("invalid --forward '{forward}': expected gelu|hopfield"),
+            };
+            println!("PPL (dense, forward={forward}): {:.4}", ppl);
             Ok(())
         }
         Cmd::Transmute { corpus, model, out, outlier_fraction } => {

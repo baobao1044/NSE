@@ -56,6 +56,30 @@ pub fn dense_ppl(lm: &ToyLm, ids: &[u32], seq_len: usize) -> f32 {
     }
 }
 
+/// PPL of the dense [`ToyLm`] under the **Hopfield retrieval forward** path
+/// ([`ToyLm::forward_hopfield`]): the FFN uses `ff_down · softmax(β·(ff_up·h2))`
+/// instead of GELU. Used to test the architecture-mismatch hypothesis (5.4) —
+/// a Hopfield-trained model's writes are designed for softmax retrieval, so
+/// this path should beat GELU if the mismatch hypothesis holds.
+pub fn dense_ppl_hopfield(lm: &ToyLm, ids: &[u32], seq_len: usize, beta: f32) -> f32 {
+    let vocab = lm.config.vocab_size;
+    let mut total_lp = 0.0f32;
+    let mut count = 0usize;
+    for start in 0..ids.len().saturating_sub(seq_len + 1) {
+        let tokens = &ids[start..start + seq_len];
+        let targets = &ids[start + 1..start + 1 + seq_len];
+        let logits = lm.forward_hopfield(tokens, beta);
+        let lp = logprobs(&logits, targets, vocab);
+        total_lp += lp.iter().sum::<f32>();
+        count += lp.len();
+    }
+    if count == 0 {
+        f32::INFINITY
+    } else {
+        (-total_lp / count as f32).exp()
+    }
+}
+
 /// PPL of the sparse [`TransmutedModel`] over a sliding window of length
 /// `seq_len`, predicting t+1, using the given [`Activation`](super::sparse_forward::Activation).
 /// Uses default runtime options (scalar kernel, brute-force index).

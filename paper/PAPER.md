@@ -308,6 +308,51 @@ không chuẩn hóa G) — giữ hướng + ngăn phình, nhưng cần history b
 Phase tiếp theo. Variant `LayerNorm` giữ lại trong code (`--homeostasis
 layernorm`) để reproduce negative result này.
 
+#### 5.4.2 LSH + FF hybrid (warm-start) — tổng hợp thắng từng phần
+
+Phân tích 5.4 chỉ ra FF (goodness cục bộ, cần ức chế) và LSH-sparse (backprop +
+che gradient theo locality) giải đúng vấn đề của nhau: FF cung cấp *plasticity*
+(học cục bộ, không cần gradient toàn cục), LSH cung cấp *locality* (biết "đi
+đâu"). Thí nghiệm warm-start: huấn luyện FF (15 epochs, clip 0.5 sweet spot) →
+fine-tune LSH-sparse (15 epochs), so với LSH thuần (random init) cùng tổng
+compute 30 epochs:
+
+| Cấu hình | Tổng epochs | PPL |
+|---|---:|---:|
+| LSH thuần (random init) | 30 | 19.49 |
+| **Hybrid (FF warm 15 + LSH 15)** | 30 | **18.26** (−1.23, −6%) |
+
+Hybrid thắng LSH thuần ~6% khi cùng tổng compute: FF warm-start đặt model ở
+basin tốt hơn random init (goodness cục bộ cho plasticity), LSH-sparse
+fine-tune (che gradient theo locality) tận dụng điểm khởi đầu đó. Objective
+exploit của FF bị tránh bằng cách "hand-off" sang LSH sớm; "biết đi đâu, chưa
+biết học thế nào" của LSH được FF warm-start cung cấp "how". Đây là bằng chứng
+cho ý tưởng kiến trúc tổng hợp: các vai trò tách rời (memory/routing/learning)
+có thể cộng tác.
+
+#### 5.4.3 Hopfield retrieval forward — mismatch hypothesis xác nhận
+
+5.4 kết luận Hopfield cần forward-path softmax (thay GELU). Thí nghiệm: huấn
+luyện Hopfield (CLI corpus, regime non-trivial, PPL 53 > uniform 38) rồi eval
+cùng model dưới hai forward path:
+
+| Forward path | PPL |
+|---|---:|
+| GELU (standard dense) | 62.40 |
+| Hopfield retrieval (β=8) | **50.86** (−11.54, −18%) |
+| Hopfield retrieval (β=4) | 50.97 |
+| Hopfield retrieval (β=16) | 50.83 |
+
+Hopfield retrieval thắng GELU **11.5 PPL (−18%)** — **mismatch hypothesis xác
+nhận**: writes của Hopfield được thiết kế cho `ff_down · softmax(β·(ff_up·k))`,
+GELU (`gelu(h2·ff_up)·ff_down`) không match cơ chế retrieval. β không nhạy
+(4/8/16 → ~50.8). Lưu ý: PPL vẫn > uniform (38) — forward-path đúng cải thiện
+nhưng chưa đủ để vượt baseline, vì Hopfield writes là memory lookup (recall
+đúng) chứ không phải representation learner (generalize yếu). Điều này củng cố
+kết luận 5.4: Hopfield làm *hippocampus* (memory retrieval) tốt hơn *cortex*
+(representation learning) — cần kết hợp với learning pathway (FF/LSH) để có
+giá trị đầy đủ.
+
 **Hopfield — sweep `value_scale`** (num_writes=64):
 
 | value_scale | PPL |
