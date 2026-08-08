@@ -84,6 +84,9 @@ enum Cmd {
         lr: f32,
         #[arg(long, default_value_t = 0.01)]
         hebb_lr: f32,
+        /// Per-weight max-norm clamp (FF stabilization; 0 disables).
+        #[arg(long, default_value_t = 1.0)]
+        weight_clip: f32,
     },
     /// Train the Toy LM by writing associative memories into the FFN
     /// (modern Hopfield, one-shot writes, no backprop). Research prototype.
@@ -106,6 +109,9 @@ enum Cmd {
         num_writes: usize,
         #[arg(long, default_value_t = 8.0)]
         beta: f32,
+        /// Scale of the value written into the FFN (after unit-normalizing).
+        #[arg(long, default_value_t = 0.1)]
+        value_scale: f32,
     },
     /// Train the Toy LM with LSH-sparse updates (dense backprop + per-row LSH
     /// gradient masking). Closest to SGD; updates ~sparse_fraction of rows/step.
@@ -223,7 +229,7 @@ pub fn run() -> Result<()> {
             eprintln!("Saved trained model to {}", out.display());
             Ok(())
         }
-        Cmd::TrainFf { corpus, out, dim, layers, heads, seq_len, ff_dim, epochs, lr, hebb_lr } => {
+        Cmd::TrainFf { corpus, out, dim, layers, heads, seq_len, ff_dim, epochs, lr, hebb_lr, weight_clip } => {
             let corpus_bytes = std::fs::read(&corpus)
                 .with_context(|| format!("reading corpus {}", corpus.display()))?;
             let tok = Tokenizer::from_corpus(&corpus_bytes);
@@ -236,12 +242,13 @@ pub fn run() -> Result<()> {
                 ff_dim,
             };
             let mut lm = ToyLm::init_random(cfg.clone(), 1337);
-            eprintln!("Training Toy LM (Forward-Forward): local goodness, no global backprop");
+            eprintln!("Training Toy LM (Forward-Forward): local goodness, no global backprop, weight_clip={weight_clip}");
             let mut trainer = ForwardForwardTrainer::new(ForwardForwardConfig {
                 learning_rate: lr,
                 seq_len,
                 epochs,
                 hebbian_embed_lr: hebb_lr,
+                weight_clip,
                 log_every: 10,
                 ..Default::default()
             });
@@ -250,7 +257,7 @@ pub fn run() -> Result<()> {
             eprintln!("Saved FF-trained model to {}", out.display());
             Ok(())
         }
-        Cmd::TrainHopfield { corpus, out, dim, layers, heads, seq_len, ff_dim, num_writes, beta } => {
+        Cmd::TrainHopfield { corpus, out, dim, layers, heads, seq_len, ff_dim, num_writes, beta, value_scale } => {
             let corpus_bytes = std::fs::read(&corpus)
                 .with_context(|| format!("reading corpus {}", corpus.display()))?;
             let tok = Tokenizer::from_corpus(&corpus_bytes);
@@ -263,11 +270,12 @@ pub fn run() -> Result<()> {
                 ff_dim,
             };
             let mut lm = ToyLm::init_random(cfg.clone(), 1337);
-            eprintln!("Training Toy LM (Hopfield): one-shot associative writes into FFN");
+            eprintln!("Training Toy LM (Hopfield): one-shot associative writes into FFN, value_scale={value_scale}");
             let mut trainer = HopfieldTrainer::new(HopfieldConfig {
                 seq_len,
                 num_writes,
                 beta,
+                value_scale,
                 log_every: 1,
                 ..Default::default()
             });
