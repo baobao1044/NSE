@@ -19,12 +19,12 @@ Kết quả quan trọng nhất của POC: **đo sụt giảm PPL** dense vs spa
 |---|---|
 | `nse-core` | Types, errors, format `.nse` (mmap) |
 | `nse-models` | Toy LM + tokenizer + safetensors loader |
-| `nse-train` | Trainer trait + SGD (real) + FF/Hopfield/LSH (scaffold) |
+| `nse-train` | Trainer trait + SGD (real) + FF/Hopfield/LSH (real) + Composite (M7) |
 | `nse-zstm` | Outlier + k-means + ternary/PQ quantization |
 | `nse-rie` | MIPS index + threshold router + bias compensator |
 | `nse-ller` | Cache tiling + SIMD kernel (scalar ref + AVX2) |
-| `nse-eval` | PPL dense vs sparse + báo cáo |
-| `nse-cli` | CLI: train / eval / transmute |
+| `nse-eval` | PPL dense/sparse + Hopfield forward + báo cáo + 4-path composite |
+| `nse-cli` | CLI: train / train-composite / eval / eval-composite / transmute |
 
 ## Build & test
 
@@ -52,19 +52,27 @@ cargo run --release -- eval compare   # -> báo cáo so sánh
 - [x] **M4**: nse-rie + nse-ller scalar kernel → sparse inference correct.
 - [x] **M5**: nse-eval + nse-cli → báo cáo so sánh PPL dense vs sparse.
 - [x] **M6**: Scaffold AVX2/HNSW/PQ + 3 thuật toán training (FF/Hopfield/LSH-sparse).
+- [x] **M7**: Composite trainer (hippocampus+cortex: SGD warm → Hopfield → FF → LSH-sparse)
+      + sparse Hopfield forward + `eval-composite` 4-path (dense/sparse × GELU/Hopfield).
 
 ## Kết quả POC
 
 Pipeline end-to-end chạy được:
 
 ```bash
-nse train        # PPL 18 → 9.5 (training)
-nse eval-dense   # PPL dense  = 17.6
-nse transmute    # dense → .nse (ZSTM)
-nse eval-sparse  # PPL sparse = 53.2 (all) / 73.5 (threshold)
-nse eval-compare # báo cáo so sánh
+nse train          # PPL 18 → 9.5 (training)
+nse eval-dense     # PPL dense  = 17.6
+nse transmute      # dense → .nse (ZSTM)
+nse eval-sparse    # PPL sparse = 53.2 (all) / 73.5 (threshold)
+nse eval-compare   # báo cáo so sánh
+nse train-composite # FF 15 + LSH 15 → PPL 21.44 (thắng từng trainer riêng)
+nse eval-composite  # 4-path: dense/sparse × GELU/Hopfield
 ```
 
+Composite (M7, kiến trúc tổng hợp hippocampus+cortex) thắng từng trainer riêng
+(FF 26.04, LSH 24.12, Hopfield 62.40 → 21.44) cùng compute, không thắng SGD
+(12.37) — đúng kỳ vọng (backprop đầy đủ mạnh nhất). Sparse Hopfield trên
+ternary keys = negative result (ternary phá cosine structure) — tài liệu hóa.
 Degradation chỉ từ ternary quantization (mode all) hoặc pruning+bias (mode threshold).
 Tất cả kernel math dùng scalar reference chính xác; AVX2/HNSW/PQ là scaffold
 cho phase tối ưu hiệu năng sau.

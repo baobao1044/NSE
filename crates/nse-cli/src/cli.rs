@@ -8,14 +8,17 @@
 //! nse train-ff       -> toy_lm.safetensors   (Forward-Forward trainer)
 //! nse train-hopfield -> toy_lm.safetensors   (Hopfield associative writes)
 //! nse train-lsh      -> toy_lm.safetensors   (LSH-sparse trainer)
+//! nse train-composite -> toy_lm_comp.safetensors (hippocampus+cortex pipeline, M7)
 //! nse eval dense     -> PPL_dense            (baseline perplexity)
 //! nse transmute      -> model.nse            (ZSTM: outlier + k-means + ternary)
 //! nse eval sparse     -> PPL_sparse          (RIE + LLER, --kernel/--index)
 //! nse eval compare    -> report             (PPL_dense | PPL_sparse | % drop)
+//! nse eval-composite  -> 4-path report      (dense/sparse × GELU/Hopfield, M7)
 //! ```
 //!
 //! `--kernel scalar|avx2|auto` and `--index brute|hnsw` select the LLER/RIE
-//! backends used by the sparse eval path (N1/N2).
+//! backends used by the sparse eval path (N1/N2). `--beta` sets the Hopfield
+//! retrieval sharpness for the composite eval (M7).
 
 #![allow(dead_code)]
 
@@ -24,11 +27,18 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use nse_eval::{compare_with_options, dense_ppl, sparse_ppl_with_options, Activation, SparseOptions};
+use nse_eval::{
+    compare_composite, compare_with_options, dense_ppl, sparse_ppl_with_options, Activation,
+    CompositeReport, SparseOptions,
+};
 use nse_ller::KernelKind;
 use nse_models::{Config, Tokenizer, ToyLm};
 use nse_rie::IndexKind;
-use nse_train::{ForwardForwardConfig, ForwardForwardTrainer, HopfieldConfig, HopfieldTrainer, LshSparseConfig, LshSparseTrainer, SgdConfig, SgdTrainer, Trainer};
+use nse_train::{
+    CompositeConfig, CompositeTrainer, ForwardForwardConfig, ForwardForwardTrainer,
+    HopfieldConfig, HopfieldTrainer, LshSparseConfig, LshSparseTrainer, SgdConfig, SgdTrainer,
+    Trainer,
+};
 use nse_zstm::{transmute, save_transmuted, load_transmuted, TransmuteConfig};
 
 #[derive(Parser, Debug)]
@@ -145,6 +155,49 @@ enum Cmd {
         #[arg(long, default_value_t = 0.01)]
         sparse_fraction: f32,
     },
+    /// Train the Toy LM with the composite "hippocampus + cortex" pipeline:
+    /// SGD warm → Hopfield writes → Forward-Forward (local) → LSH-sparse
+    /// fine-tune. Each phase is skipped when its epoch/write count is 0.
+    /// Research prototype; bar = beat or match SGD at comparable compute.
+    TrainComposite {
+        #[arg(long, default_value = "data/corpus.txt")]
+        corpus: PathBuf,
+        #[arg(long, default_value = "toy_lm_comp.safetensors")]
+        out: PathBuf,
+        #[arg(long, default_value_t = 32)]
+        dim: usize,
+        #[arg(long, default_value_t = 2)]
+        layers: usize,
+        #[arg(long, default_value_t = 4)]
+        heads: usize,
+        #[arg(long, default_value_t = 16)]
+        seq_len: usize,
+        #[arg(long, default_value_t = 64)]
+        ff_dim: usize,
+        /// Phase 1: SGD warm epochs (0 skips — off by default, FF warm is the
+        /// stabilizer per paper §5.4.2).
+        #[arg(long, default_value_t = 0)]
+        sgd_epochs: usize,
+        /// Phase 2: Hopfield one-shot writes per layer (0 skips — off by
+        /// default due to the dense-PPL mismatch, §5.4.3).
+        #[arg(long, default_value_t = 0)]
+        hopfield_writes: usize,
+        /// Phase 3: Forward-Forward epochs (warm-start, 0 skips).
+        #[arg(long, default_value_t = 15)]
+        ff_epochs: usize,
+        /// Phase 4: LSH-sparse fine-tune epochs (0 skips).
+        #[arg(long, default_value_t = 15)]
+        lsh_epochs: usize,
+        /// FF max-norm clamp (homeostasis sweet spot 0.5, paper §5.4).
+        #[arg(long, default_value_t = 0.5)]
+        ff_clip: f32,
+        /// LSH sparse-fraction (fraction of rows updated/step).
+        #[arg(long, default_value_t = 0.01)]
+        lsh_frac: f32,
+        /// Retrieval sharpness β used by the between-phase PPL probe.
+        #[arg(long, default_value_t = 8.0)]
+        eval_beta: f32,
+    },
     /// Evaluate dense PPL of a trained model.
     EvalDense {
         #[arg(long, default_value = "data/corpus.txt")]
@@ -205,6 +258,28 @@ enum Cmd {
         nse: PathBuf,
         #[arg(long, default_value_t = 16)]
         seq_len: usize,
+        /// LLER kernel backend: "scalar" | "avx2" | "auto".
+        #[arg(long, default_value = "auto")]
+        kernel: String,
+        /// RIE index backend: "brute" | "hnsw".
+        #[arg(long, default_value = "brute")]
+        index: String,
+    },
+    /// Compare all four forward paths (dense/sparse × GELU/Hopfield) and print
+    /// the composite report — the §5.6 artifact. `beta` is the Hopfield
+    /// retrieval sharpness (used for both dense and sparse retrieval paths).
+    EvalComposite {
+        #[arg(long, default_value = "data/corpus.txt")]
+        corpus: PathBuf,
+        #[arg(long, default_value = "toy_lm_comp.safetensors")]
+        model: PathBuf,
+        #[arg(long, default_value = "model.nse")]
+        nse: PathBuf,
+        #[arg(long, default_value_t = 16)]
+        seq_len: usize,
+        /// Hopfield retrieval sharpness β.
+        #[arg(long, default_value_t = 8.0)]
+        beta: f32,
         /// LLER kernel backend: "scalar" | "avx2" | "auto".
         #[arg(long, default_value = "auto")]
         kernel: String,
@@ -338,6 +413,55 @@ pub fn run() -> Result<()> {
             eprintln!("Saved LSH-trained model to {}", out.display());
             Ok(())
         }
+        Cmd::TrainComposite {
+            corpus, out, dim, layers, heads, seq_len, ff_dim,
+            sgd_epochs, hopfield_writes, ff_epochs, lsh_epochs, ff_clip, lsh_frac, eval_beta,
+        } => {
+            let corpus_bytes = std::fs::read(&corpus)
+                .with_context(|| format!("reading corpus {}", corpus.display()))?;
+            let tok = Tokenizer::from_corpus(&corpus_bytes);
+            let cfg = Config {
+                vocab_size: tok.vocab_size,
+                dim,
+                num_layers: layers,
+                num_heads: heads,
+                max_seq_len: seq_len,
+                ff_dim,
+            };
+            let mut lm = ToyLm::init_random(cfg.clone(), 1337);
+            eprintln!(
+                "Training Toy LM (composite): SGD {sgd_epochs} ep + Hopfield {hopfield_writes} writes + FF {ff_epochs} ep (clip {ff_clip}) + LSH {lsh_epochs} ep (frac {lsh_frac})"
+            );
+            let sgd_cfg = SgdConfig {
+                learning_rate: 0.05, seq_len, epochs: sgd_epochs, lr_decay: 1.0,
+                log_every: 0, seed: 1337,
+            };
+            let hop_cfg = HopfieldConfig {
+                seq_len, num_writes: hopfield_writes, beta: eval_beta, value_scale: 0.1,
+                log_every: 0, seed: 3,
+            };
+            let ff_cfg = ForwardForwardConfig {
+                learning_rate: 0.02, seq_len, epochs: ff_epochs, hebbian_embed_lr: 0.01,
+                weight_clip: ff_clip, log_every: 10, ..Default::default()
+            };
+            let lsh_cfg = LshSparseConfig {
+                learning_rate: 0.05, seq_len, epochs: lsh_epochs,
+                sparse_fraction: lsh_frac, log_every: 10, ..Default::default()
+            };
+            let mut trainer = CompositeTrainer::new(CompositeConfig {
+                sgd_warm: sgd_cfg,
+                hopfield: hop_cfg,
+                ff: ff_cfg,
+                lsh: lsh_cfg,
+                eval_seq_len: seq_len,
+                eval_beta,
+                log_every: 1,
+            });
+            trainer.train(&mut lm, &corpus_bytes)?;
+            nse_models::loader::save_toy_lm(&out, &lm)?;
+            eprintln!("Saved composite-trained model to {}", out.display());
+            Ok(())
+        }
         Cmd::EvalDense { corpus, model, seq_len, forward, beta } => {
             let corpus_bytes = std::fs::read(&corpus)?;
             let lm = nse_models::loader::load_toy_lm(&model)?;
@@ -392,6 +516,20 @@ pub fn run() -> Result<()> {
             };
             let report = compare_with_options(&lm, &tm, &corpus_bytes, seq_len, Activation::All, opts);
             println!("{}\n{}", "=== NSE POC: Dense vs Sparse PPL ===", report.pretty());
+            Ok(())
+        }
+        Cmd::EvalComposite { corpus, model, nse, seq_len, beta, kernel, index } => {
+            let corpus_bytes = std::fs::read(&corpus)?;
+            let lm = nse_models::loader::load_toy_lm(&model)?;
+            let tm = load_transmuted(&nse)?;
+            let opts = SparseOptions {
+                kernel: parse_kernel(&kernel)?,
+                index: parse_index(&index)?,
+            };
+            let report: CompositeReport = compare_composite(
+                &lm, &tm, &corpus_bytes, seq_len, beta, Activation::All, opts,
+            );
+            println!("{}", report.pretty());
             Ok(())
         }
     }

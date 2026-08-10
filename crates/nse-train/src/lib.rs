@@ -19,7 +19,8 @@
 //! Shared momentum + gradient-clipping helpers live in [`sgd_apply`] and are
 //! reused by SGD and LSH-sparse.
 //!
-//! Status: SGD (M2) + AVX2/HNSW/LSH/FF/Hopfield (N1-N5) implemented and tested.
+//! Status: SGD (M2) + AVX2/HNSW/LSH/FF/Hopfield (N1-N5) + Composite (M7)
+//! implemented and tested.
 
 #![allow(dead_code)]
 
@@ -30,9 +31,11 @@ pub mod forward_forward;
 pub mod hopfield;
 pub mod lsh;
 pub mod lsh_sparse;
+pub mod composite;
 
 pub use sgd::{SgdConfig, SgdTrainer};
 pub use forward_forward::{ForwardForwardConfig, ForwardForwardTrainer, Homeostasis};
 pub use hopfield::{HopfieldConfig, HopfieldTrainer, hopfield_retrieve};
 pub use lsh_sparse::{LshSparseConfig, LshSparseTrainer};
+pub use composite::{CompositeConfig, CompositeTrainer};
 pub use trainer::Trainer;

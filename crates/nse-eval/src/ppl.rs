@@ -117,3 +117,55 @@ pub fn sparse_ppl_with_options(
         (-total_lp / count as f32).exp()
     }
 }
+
+/// Sparse PPL under the **Hopfield retrieval forward** path
+/// ([`super::sparse_forward::sparse_forward_hopfield_with_options`]): the FFN
+/// uses `ff_down · softmax(β·(ff_up·h2))` over the reconstructed (ternary)
+/// key/value store instead of GELU. Used by §5.6 to test whether ternary-
+/// quantized keys retain enough cosine structure for retrieval — the
+/// research question of the composite-architecture evaluation.
+pub fn sparse_ppl_hopfield_with_options(
+    tm: &TransmutedModel,
+    ids: &[u32],
+    seq_len: usize,
+    beta: f32,
+    act: super::sparse_forward::Activation,
+    opts: super::sparse_forward::SparseOptions,
+) -> f32 {
+    let vocab = tm.config.vocab_size;
+    let mut total_lp = 0.0f32;
+    let mut count = 0usize;
+    for start in 0..ids.len().saturating_sub(seq_len + 1) {
+        let tokens = &ids[start..start + seq_len];
+        let targets = &ids[start + 1..start + 1 + seq_len];
+        let logits = super::sparse_forward::sparse_forward_hopfield_with_options(
+            tm, tokens, beta, act, opts,
+        );
+        let lp = logprobs(&logits, targets, vocab);
+        total_lp += lp.iter().sum::<f32>();
+        count += lp.len();
+    }
+    if count == 0 {
+        f32::INFINITY
+    } else {
+        (-total_lp / count as f32).exp()
+    }
+}
+
+/// Sparse Hopfield PPL with default options (scalar kernel, brute index).
+pub fn sparse_ppl_hopfield(
+    tm: &TransmutedModel,
+    ids: &[u32],
+    seq_len: usize,
+    beta: f32,
+    act: super::sparse_forward::Activation,
+) -> f32 {
+    sparse_ppl_hopfield_with_options(
+        tm,
+        ids,
+        seq_len,
+        beta,
+        act,
+        super::sparse_forward::SparseOptions::default(),
+    )
+}

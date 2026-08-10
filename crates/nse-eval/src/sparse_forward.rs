@@ -235,3 +235,157 @@ fn gelu_inplace(x: &mut [f32]) {
         *v = 0.5 * *v * (1.0 + tanh);
     }
 }
+
+/// Reconstruct the full dense weight matrix `W [out, in]` from a
+/// [`SparseLayer`]: dense core rows (FP32) plus each expert's ternary rows
+/// rescaled by their per-row scale (`~w = scale * ternary`). Used by the
+/// Hopfield-retrieval sparse forward, which needs the full (reconstructed)
+/// `ff_up`/`ff_down` matrices as the associative-memory key/value store.
+///
+/// Honest limitation: this reconstructs on every forward call — fine for the
+/// POC's small matrices, but a production path would cache the reconstruction
+/// (or implement retrieval directly on the ternary codes + scales).
+fn reconstruct_dense(sl: &SparseLayer) -> Vec<f32> {
+    let out = sl.out_dim;
+    let in_dim = sl.in_dim;
+    let mut w = vec![0.0f32; out * in_dim];
+    // Core rows: kept dense (FP32), copied verbatim.
+    for (i, &r) in sl.core_row_ids.iter().enumerate() {
+        let row = r as usize;
+        w[row * in_dim..(row + 1) * in_dim]
+            .copy_from_slice(&sl.dense_core.data[i * in_dim..(i + 1) * in_dim]);
+    }
+    // Expert rows: ternary code × per-row scale.
+    for e in &sl.experts {
+        for (j, &r) in e.row_ids.iter().enumerate() {
+            let scale = e.row_scales[j];
+            let row = r as usize;
+            let code_off = j * in_dim;
+            for k in 0..in_dim {
+                w[row * in_dim + k] = scale * e.ternary[code_off + k] as f32;
+            }
+        }
+    }
+    w
+}
+
+/// Sparse forward with the FFN replaced by a **Hopfield retrieval** rule:
+/// instead of `gelu(sparse(ff_up)(h2)) → sparse(ff_down)`, the FFN output is
+/// `ff_down · softmax(β · (ff_up · h2))` per position, where `ff_up`/`ff_down`
+/// are the dense reconstructions of the transmuted (ternary-quantized) layers.
+///
+/// This is the sparse analogue of [`nse_models::ToyLm::forward_hopfield`]: it
+/// tests whether the ternary-quantized keys/values still carry enough cosine
+/// structure for softmax retrieval to work — the research question of §5.6.
+/// The attention sub-block keeps the sparse (routed) path; only the FFN
+/// switches to retrieval.
+///
+/// `act` controls expert routing for the attention matmuls (qkv, attn_out).
+/// The FFN retrieval uses the *full* reconstructed key/value store (no
+/// pruning) — retrieval already selects memories via the softmax, so an
+/// additional expert router would be redundant.
+pub fn sparse_forward_hopfield_with_options(
+    tm: &TransmutedModel,
+    tokens: &[u32],
+    beta: f32,
+    act: Activation,
+    opts: SparseOptions,
+) -> Vec<f32> {
+    let cfg = &tm.config;
+    let seq = tokens.len();
+    let d = cfg.dim;
+    let v = cfg.vocab_size;
+    let nh = cfg.num_heads;
+    let fd = cfg.ff_dim;
+
+    // 1. Token embedding lookup (dense, unchanged).
+    let mut x = vec![0.0f32; seq * d];
+    for (t, &tok) in tokens.iter().enumerate() {
+        let tok = (tok as usize).min(v - 1);
+        for j in 0..d {
+            x[t * d + j] = tm.token_embed.data[tok * d + j];
+        }
+    }
+
+    // 2. Per-layer block.
+    for layer in 0..cfg.num_layers {
+        let block = &tm.layers[layer];
+        let ln1 = &tm.ln1_gain[layer];
+        let ln2 = &tm.ln2_gain[layer];
+
+        // --- Attention sub-block (sparse, routed) ---
+        let h = layernorm(&x, seq, d, ln1);
+        let qkv_out = sparse_linear_seq(&block[IDX_QKV], &h, act, opts);
+        let (q, k, vp) = split_qkv(&qkv_out, seq, d);
+        let attn = causal_self_attention(&q, &k, &vp, seq, d, nh);
+        let attn_proj = sparse_linear_seq(&block[IDX_ATTN_OUT], &attn, act, opts);
+        for i in 0..seq * d {
+            x[i] += attn_proj[i];
+        }
+
+        // --- FFN sub-block: Hopfield retrieval on reconstructed ternary store ---
+        let h2 = layernorm(&x, seq, d, ln2); // [seq, dim] — the query
+        let ff_up = reconstruct_dense(&block[IDX_FF_UP]);   // [ff_dim, dim] keys
+        let ff_down = reconstruct_dense(&block[IDX_FF_DOWN]); // [dim, ff_dim] values
+        for t in 0..seq {
+            // scores[i] = β · (ff_up[i,:] · h2[t,:])
+            let mut scores = vec![0.0f32; fd];
+            let mut max = f32::NEG_INFINITY;
+            for i in 0..fd {
+                let mut s = 0.0;
+                for j in 0..d {
+                    s += ff_up[i * d + j] * h2[t * d + j];
+                }
+                s *= beta;
+                scores[i] = s;
+                if s > max {
+                    max = s;
+                }
+            }
+            // softmax over slots
+            let mut sum = 0.0;
+            for s in scores.iter_mut() {
+                *s = (*s - max).exp();
+                sum += *s;
+            }
+            let inv = if sum > 0.0 { 1.0 / sum } else { 0.0 };
+            for s in scores.iter_mut() {
+                *s *= inv;
+            }
+            // z[j] = Σ_i ff_down[j,i] · softmax_i ; residual add
+            for j in 0..d {
+                let mut acc = 0.0;
+                for i in 0..fd {
+                    acc += ff_down[j * fd + i] * scores[i];
+                }
+                x[t * d + j] += acc;
+            }
+        }
+    }
+
+    // 3. Final layernorm.
+    let x = layernorm(&x, seq, d, &tm.ln_f_gain);
+
+    // 4. Tied head (dense, unchanged): logits = x @ E^T.
+    let mut logits = vec![0.0f32; seq * v];
+    for t in 0..seq {
+        for w in 0..v {
+            let mut s = 0.0;
+            for j in 0..d {
+                s += x[t * d + j] * tm.token_embed.data[w * d + j];
+            }
+            logits[t * v + w] = s;
+        }
+    }
+    logits
+}
+
+/// Sparse Hopfield forward with default options (scalar kernel, brute index).
+pub fn sparse_forward_hopfield(
+    tm: &TransmutedModel,
+    tokens: &[u32],
+    beta: f32,
+    act: Activation,
+) -> Vec<f32> {
+    sparse_forward_hopfield_with_options(tm, tokens, beta, act, SparseOptions::default())
+}
