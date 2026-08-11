@@ -19,6 +19,10 @@ pub mod kernel;
 pub mod tiling;
 
 pub use avx2::{
-    compute_dense_core_dispatch, compute_ternary_micro_expert_dispatch, KernelKind,
+    compute_dense_core_dispatch, compute_pq_micro_expert_dispatch,
+    compute_ternary_micro_expert_dispatch, KernelKind,
 };
-pub use kernel::{apply_bias, compute_dense_core, compute_ternary_micro_expert_scalar};
+pub use kernel::{
+    apply_bias, compute_dense_core, compute_pq_micro_expert_scalar,
+    compute_ternary_micro_expert_scalar,
+};

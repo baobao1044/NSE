@@ -36,6 +36,7 @@ fn main() {
         row_scales: (0..n_rows).map(|i| 0.01 + (i as f32) * 0.001).collect(),
         centroid: vec![0.0; in_dim],
         mean_input: vec![0.0; in_dim],
+        pq: None,
     };
     let x = vec![0.5f32; in_dim];
     let mut y = vec![0.0f32; n_rows];

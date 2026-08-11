@@ -39,7 +39,7 @@ use nse_train::{
     HopfieldConfig, HopfieldTrainer, LshSparseConfig, LshSparseTrainer, SgdConfig, SgdTrainer,
     Trainer,
 };
-use nse_zstm::{transmute, save_transmuted, load_transmuted, TransmuteConfig};
+use nse_zstm::{transmute, save_transmuted, load_transmuted, QuantSchemeConfig, TransmuteConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "nse", about = "Neuro-Sparse Engine POC CLI")]
@@ -225,6 +225,20 @@ enum Cmd {
         out: PathBuf,
         #[arg(long, default_value_t = 0.1)]
         outlier_fraction: f32,
+        /// Quantization scheme for the expert weights:
+        /// "ternary" (default, `{-1,0,1}` + per-row scale) or "pq" (Product
+        /// Quantization, 8-bit shared codebook per layer — Phase 7 / M8).
+        #[arg(long, default_value = "ternary")]
+        quant: String,
+        /// Number of PQ sub-vectors `M` (only used with `--quant pq`).
+        /// `in_dim` must be divisible by `M`; the largest divisor `<= M` is
+        /// used if not. Default 4 → `sub_dim = in_dim/4` (e.g. 16 for dim=64).
+        #[arg(long, default_value_t = 4)]
+        pq_subvectors: usize,
+        /// PQ codebook bits per code (only used with `--quant pq`).
+        /// `8` → 256 centroids per sub-codebook (plan default).
+        #[arg(long, default_value_t = 8)]
+        pq_nbits: usize,
     },
     /// Evaluate sparse PPL of a transmuted model.
     EvalSparse {
@@ -475,12 +489,37 @@ pub fn run() -> Result<()> {
             println!("PPL (dense, forward={forward}): {:.4}", ppl);
             Ok(())
         }
-        Cmd::Transmute { corpus, model, out, outlier_fraction } => {
+        Cmd::Transmute { corpus, model, out, outlier_fraction, quant, pq_subvectors, pq_nbits } => {
             let corpus_bytes = std::fs::read(&corpus)?;
             let lm = nse_models::loader::load_toy_lm(&model)?;
+            let quant_scheme = match quant.as_str() {
+                "ternary" => {
+                    eprintln!("Quantization scheme: ternary ({{-1,0,1}} + per-row scale)");
+                    QuantSchemeConfig::Ternary
+                }
+                "pq" => {
+                    eprintln!(
+                        "Quantization scheme: PQ (M={pq_subvectors} sub-vectors, {pq_nbits}-bit codebook)"
+                    );
+                    QuantSchemeConfig::Pq {
+                        num_sub_vectors: pq_subvectors,
+                        nbits: pq_nbits,
+                        iters: 20,
+                        seed: 7,
+                    }
+                }
+                other => {
+                    anyhow::bail!("unknown --quant value '{other}': expected 'ternary' or 'pq'");
+                }
+            };
             let cfg = TransmuteConfig {
                 outlier: nse_zstm::outlier::OutlierConfig { fraction: outlier_fraction },
-                ..TransmuteConfig::poc()
+                cluster: nse_zstm::cluster::ClusterConfig {
+                    num_experts: 0,
+                    iters: 10,
+                    seed: 7,
+                },
+                quant: quant_scheme,
             };
             eprintln!("Transmuting dense model -> sparse NSE format");
             let tm = transmute(&lm, Some(&corpus_bytes), &cfg)?;

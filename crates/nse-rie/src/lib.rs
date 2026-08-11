@@ -35,7 +35,7 @@ pub use nse_ller::KernelKind;
 use nse_core::sparse::SparseLayer;
 use nse_ller::{
     apply_bias as ller_apply_bias, compute_dense_core_dispatch,
-    compute_ternary_micro_expert_dispatch,
+    compute_pq_micro_expert_dispatch, compute_ternary_micro_expert_dispatch,
 };
 
 /// Which MIPS backend to use for expert routing.
@@ -86,6 +86,12 @@ pub fn build_hnsw_for_layer(sl: &SparseLayer) -> HnswIndex {
 /// compute; the rest are pruned and their average contribution is covered by
 /// the static bias. `kind` selects the compute kernel (`Scalar` = canonical,
 /// `Auto` = AVX2 if available, else scalar).
+///
+/// Each expert dispatches by its quantization scheme: `pq: Some` → PQ kernel
+/// (decodes against `sl.pq_codebook`); `pq: None` → ternary kernel. A layer is
+/// homogeneous (all experts share one scheme, set at ZSTM time), but the
+/// dispatch handles mixed layers defensively: a PQ expert needs the codebook,
+/// a ternary expert never does.
 pub fn sparse_linear_with_kernel(
     sl: &SparseLayer,
     x: &[f32],
@@ -95,10 +101,23 @@ pub fn sparse_linear_with_kernel(
     let mut y = vec![0.0f32; sl.out_dim];
     // Dense core (always on).
     compute_dense_core_dispatch(&sl.dense_core, &sl.core_row_ids, x, &mut y, kind);
-    // Activated micro-experts.
+    // Activated micro-experts — dispatch by quantization scheme.
+    let codebook = sl.pq_codebook.as_ref();
     for &eid in activated {
         let expert = &sl.experts[eid];
-        compute_ternary_micro_expert_dispatch(expert, x, &mut y, kind);
+        match (&expert.pq, codebook) {
+            (Some(_), Some(cb)) => {
+                compute_pq_micro_expert_dispatch(expert, x, &mut y, cb, kind);
+            }
+            (Some(_), None) => {
+                // Defensive: expert claims PQ but layer has no codebook
+                // (shouldn't happen — ZSTM sets both together). Skip rather
+                // than panic so a corrupt model degrades gracefully.
+            }
+            (None, _) => {
+                compute_ternary_micro_expert_dispatch(expert, x, &mut y, kind);
+            }
+        }
     }
     // Static bias (compensates pruned experts on average).
     ller_apply_bias(&sl.bias, &mut y);
@@ -140,6 +159,7 @@ mod tests {
             row_scales: expert_rows.iter().map(|(_, s, _)| *s).collect(),
             centroid: vec![1.0; in_dim],
             mean_input: vec![0.0; in_dim],
+            pq: None,
         };
         let out_dim = 1 + expert_rows.len();
         let bias = vec![0.0; out_dim];
@@ -151,6 +171,7 @@ mod tests {
             experts: vec![expert],
             bias,
             mean_input: vec![0.0; in_dim],
+            pq_codebook: None,
         }
     }
 

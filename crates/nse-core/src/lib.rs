@@ -24,4 +24,4 @@ pub mod tensor;
 
 pub use error::{NseError, NseResult};
 pub use format::{MicroExpertMeta, NSEFileHeader, NSE_MAGIC, NSE_VERSION};
-pub use sparse::{ConfigStub, MicroExpert, SparseLayer, TransmutedModel};
+pub use sparse::{ConfigStub, MicroExpert, PqCodebook, PqExpertData, SparseLayer, TransmutedModel};

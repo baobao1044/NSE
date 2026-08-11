@@ -12,3 +12,8 @@ ndarray.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+# Used only by `examples/bench_pq` (no runtime cycle: nse-zstm doesn't
+# depend on nse-ller).
+nse-zstm.workspace = true

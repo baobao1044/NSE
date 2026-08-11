@@ -23,4 +23,7 @@ pub mod pq;
 pub mod quantize;
 pub mod transmuter;
 
-pub use transmuter::{transmute, transmute_matrix, save_transmuted, load_transmuted, TransmuteConfig};
+pub use transmuter::{
+    QuantSchemeConfig, TransmuteConfig, load_transmuted, save_transmuted,
+    transmute, transmute_matrix,
+};

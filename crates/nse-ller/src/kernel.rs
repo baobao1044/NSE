@@ -12,7 +12,7 @@
 //!   micro-expert (`y[row] += scale * sum_j ternary[j] * x[j]`), realized as
 //!   add / subtract / skip to mirror the spec's AVX2 add/sub/skip scheme.
 
-use nse_core::sparse::MicroExpert;
+use nse_core::sparse::{MicroExpert, PqCodebook};
 
 /// Dense core mat-vec: for each owned output row `i`, `y[i] += W[i] . x`.
 /// `core` is `[n_core, in]`, `x` is `[in]`, `y` is `[out]` (the full output
@@ -72,6 +72,49 @@ pub fn apply_bias(bias: &[f32], y: &mut [f32]) {
     }
 }
 
+/// Scalar reference PQ micro-expert kernel.
+///
+/// For each owned output row `i` (original id `row_ids[i]`), decode its `M`
+/// PQ codes against the shared `codebook` *inline* (no allocation), dot the
+/// reconstruction with `x`, and accumulate `y[row] += row_scales[i] * dot`.
+/// This is the canonical ground-truth PQ kernel; the AVX2 version must match
+/// it within FP tolerance.
+///
+/// `expert.pq` must be `Some` and `codebook` must match the expert's
+/// `codebook_idx` — the caller (`sparse_linear_with_kernel`) guarantees this.
+pub fn compute_pq_micro_expert_scalar(
+    expert: &MicroExpert,
+    x: &[f32],
+    y: &mut [f32],
+    codebook: &PqCodebook,
+) {
+    let pq = match &expert.pq {
+        Some(p) => p,
+        None => return, // caller should dispatch ternary for pq == None
+    };
+    let m = pq.num_sub_vectors;
+    let sub_dim = codebook.sub_dim;
+    let n_entries = codebook.num_entries();
+    let in_dim = x.len();
+    debug_assert_eq!(m * sub_dim, in_dim, "PQ sub-vector geometry mismatch");
+    for i in 0..pq.row_scales.len() {
+        let rid = expert.row_ids[i] as usize;
+        let scale = pq.row_scales[i];
+        let codes = &pq.codes[i * m..(i + 1) * m];
+        let mut acc = 0.0f32;
+        for sm in 0..m {
+            let c = (codes[sm] as usize).min(n_entries - 1);
+            let base = sm * n_entries * sub_dim + c * sub_dim;
+            let cent = &codebook.codebook[base..base + sub_dim];
+            let xsub = &x[sm * sub_dim..(sm + 1) * sub_dim];
+            for j in 0..sub_dim {
+                acc += cent[j] * xsub[j];
+            }
+        }
+        y[rid] += scale * acc;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +145,7 @@ mod tests {
             row_scales: vec![2.0, 0.5],
             centroid: vec![0.0; 3],
             mean_input: vec![0.0; 3],
+            pq: None,
         };
         let x = vec![3.0, 4.0, 5.0];
         let mut y_sparse = vec![0.0f32; 2];
@@ -130,5 +174,45 @@ mod tests {
         let mut y = vec![10.0, 20.0, 30.0];
         apply_bias(&bias, &mut y);
         assert_eq!(y, vec![11.0, 22.0, 33.0]);
+    }
+
+    /// PQ scalar kernel matches the explicit decode-then-dot math. The
+    /// canonical ground truth for the PQ path (AVX2 must match within tol).
+    #[test]
+    fn pq_kernel_matches_decode() {
+        // Build a tiny codebook: M=2 sub-vectors of dim 2, 2 entries each.
+        let codebook = PqCodebook {
+            num_sub_vectors: 2,
+            nbits: 1,
+            sub_dim: 2,
+            // Sub-vector 0: centroids [1,1] and [-1,-1].
+            // Sub-vector 1: centroids [2,0] and [0,2].
+            codebook: vec![
+                1.0, 1.0, -1.0, -1.0,
+                2.0, 0.0, 0.0, 2.0,
+            ],
+        };
+        // Expert with 2 rows, scale [1.0, 0.5], in_dim=4 (=2*2).
+        // Row 0 codes [0,0] -> recon [1,1,2,0]; row 1 codes [1,1] -> recon
+        // [-1,-1,0,2] scaled by 0.5 -> [-0.5,-0.5,0,1].
+        let expert = MicroExpert {
+            row_ids: vec![0, 1],
+            ternary: vec![],
+            row_scales: vec![], // unused for PQ
+            centroid: vec![0.0; 4],
+            mean_input: vec![0.0; 4],
+            pq: Some(nse_core::sparse::PqExpertData {
+                codes: vec![0, 0, 1, 1],
+                row_scales: vec![1.0, 0.5],
+                num_sub_vectors: 2,
+            }),
+        };
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        let mut y = vec![0.0f32; 2];
+        compute_pq_micro_expert_scalar(&expert, &x, &mut y, &codebook);
+        // Row 0: scale 1.0 * ([1,1].[1,2] + [2,0].[3,4]) = (1+2) + (6+0) = 9.
+        // Row 1: scale 0.5 * ([-1,-1].[1,2] + [0,2].[3,4]) = 0.5 * (-3 + 8) = 2.5.
+        assert!((y[0] - 9.0).abs() < 1e-5, "row0: {}", y[0]);
+        assert!((y[1] - 2.5).abs() < 1e-5, "row1: {}", y[1]);
     }
 }

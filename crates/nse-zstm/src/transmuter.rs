@@ -12,28 +12,85 @@
 use std::path::Path;
 
 use nse_core::sparse::{
-    ConfigStub, MicroExpert, SparseLayer, TransmutedModel,
+    ConfigStub, MicroExpert, PqExpertData, SparseLayer, TransmutedModel,
 };
 use nse_core::tensor::Matrix;
 use nse_models::{ToyLm, forward_cached};
 
 use crate::cluster::{cluster, ClusterConfig};
 use crate::outlier::{extract, OutlierConfig};
+use crate::pq::{encode_pq, train_pq};
 use crate::quantize::quantize_matrix;
+
+/// Quantization scheme for ZSTM stage 3 (weight quantization).
+///
+/// Controls how each micro-expert's owned rows are compressed after
+/// outlier extraction + clustering. The scheme is set on [`TransmuteConfig`]
+/// and applies uniformly to every weight matrix of the model.
+#[derive(Debug, Clone)]
+pub enum QuantSchemeConfig {
+    /// Ternary `{-1, 0, 1}` + per-row scale (BitNet-style). Default — matches
+    /// all prior paper results and is backward-compatible with existing
+    /// `model.nse` files.
+    Ternary,
+    /// Product Quantization: each row splits into `num_sub_vectors`
+    /// sub-vectors, each quantized against a shared 8-bit codebook (256
+    /// centroids) trained per `SparseLayer` on the normalized residual
+    /// rows. A per-row scale (`mean(|w|)`) captures magnitude exactly, so
+    /// the codebook only needs to represent shape — 256 levels per
+    /// sub-vector vs ternary's 3. Targets the +82% sparse PPL degradation
+    /// (paper 5.2) by replacing coarse ternary with a learned codebook.
+    Pq {
+        /// Number of sub-vectors `M`. `in_dim` must be divisible by `M`
+        /// (otherwise the largest divisor `<= M` is used). `M=4` for
+        /// `dim=64` gives `sub_dim=16` (plan default).
+        num_sub_vectors: usize,
+        /// Bits per code. `8` → 256 centroids per sub-codebook (plan default).
+        nbits: usize,
+        /// K-means iterations per sub-vector codebook.
+        iters: usize,
+        /// Deterministic centroid init seed.
+        seed: u64,
+    },
+}
+
+impl Default for QuantSchemeConfig {
+    fn default() -> Self {
+        QuantSchemeConfig::Ternary
+    }
+}
 
 /// Full transmutation configuration.
 #[derive(Debug, Clone, Default)]
 pub struct TransmuteConfig {
     pub outlier: OutlierConfig,
     pub cluster: ClusterConfig,
+    pub quant: QuantSchemeConfig,
 }
 
 impl TransmuteConfig {
-    /// A small default good enough for the POC toy model.
+    /// A small default good enough for the POC toy model (ternary scheme).
     pub fn poc() -> Self {
         Self {
             outlier: OutlierConfig { fraction: 0.1 },
             cluster: ClusterConfig { num_experts: 0, iters: 10, seed: 7 },
+            quant: QuantSchemeConfig::Ternary,
+        }
+    }
+
+    /// PQ variant of [`poc`]: same outlier/cluster defaults but with Product
+    /// Quantization (M=4 sub-vectors, 8-bit codebook, 20 k-means iters).
+    /// Used by the sparse-quality recovery experiments (Phase 7 / M8).
+    pub fn pq() -> Self {
+        Self {
+            outlier: OutlierConfig { fraction: 0.1 },
+            cluster: ClusterConfig { num_experts: 0, iters: 10, seed: 7 },
+            quant: QuantSchemeConfig::Pq {
+                num_sub_vectors: 4,
+                nbits: 8,
+                iters: 20,
+                seed: 7,
+            },
         }
     }
 }
@@ -84,6 +141,13 @@ pub fn transmute(
 
 /// Transmute a single weight matrix `W [out, in]` into a [`SparseLayer`].
 /// `mean_input` (length `in`) is the expected activation; it seeds the bias.
+///
+/// The quantization scheme is selected by `cfg.quant`:
+/// - [`QuantSchemeConfig::Ternary`] (default): ternary `{-1,0,1}` + per-row
+///   scale per expert (the original M1–M7 path).
+/// - [`QuantSchemeConfig::Pq`]: trains one shared PQ codebook on the
+///   normalized residual rows, encodes each expert's rows against it, and
+///   stores the codebook on the returned `SparseLayer::pq_codebook`.
 pub fn transmute_matrix(
     w: &Matrix,
     mean_input: &[f32],
@@ -108,35 +172,37 @@ pub fn transmute_matrix(
     let cluster_res = cluster(residual, &cfg.cluster)?;
     let n_experts = cluster_res.centroids.rows;
 
-    // Stage 3: quantize each expert's rows to ternary.
-    let mut experts = Vec::with_capacity(n_experts);
-    for (k, members) in cluster_res.members.iter().enumerate() {
-        let row_ids: Vec<u32> = members
-            .iter()
-            .map(|&r| residual_row_ids[r])
-            .collect();
-        // Build a local matrix of the member rows for quantization.
-        let mut block = Matrix::zeros(members.len(), in_dim);
-        for (i, &r) in members.iter().enumerate() {
-            block.data[i * in_dim..(i + 1) * in_dim]
-                .copy_from_slice(&residual.data[r * in_dim..(r + 1) * in_dim]);
+    // Stage 3: quantize each expert's rows — branch on scheme.
+    let (experts, pq_codebook) = match &cfg.quant {
+        QuantSchemeConfig::Ternary => {
+            let experts = build_ternary_experts(
+                &cluster_res, residual, residual_row_ids, in_dim, &mean, n_experts,
+            );
+            (experts, None)
         }
-        let (ternary, row_scales) = quantize_matrix(&block);
-        // Centroid from k-means (already in input space).
-        let centroid: Vec<f32> = cluster_res.centroids.data[k * in_dim..(k + 1) * in_dim].to_vec();
-        experts.push(MicroExpert {
-            row_ids,
-            ternary,
-            row_scales,
-            centroid,
-            mean_input: mean.clone(),
-        });
-    }
+        QuantSchemeConfig::Pq { num_sub_vectors, nbits, iters, seed } => {
+            let (experts, codebook) = build_pq_experts(
+                &cluster_res,
+                residual,
+                residual_row_ids,
+                in_dim,
+                &mean,
+                n_experts,
+                *num_sub_vectors,
+                *nbits,
+                *iters,
+                *seed,
+            )?;
+            (experts, Some(codebook))
+        }
+    };
 
     // Static bias B[out]: for every output row i, B[i] = W[i] . mean_input.
     // Core rows are computed exactly at inference, so their bias entry is 0
     // (the dense core path replaces the bias). Expert rows get the full
     // contribution so the pruned-expert path is unbiased on average.
+    // This is scheme-agnostic: it uses the *original* weights, not the
+    // quantized form, so ternary and PQ layers share the same bias.
     let mut bias = vec![0.0f32; out_dim];
     for i in 0..out_dim {
         let row = &w.data[i * in_dim..(i + 1) * in_dim];
@@ -155,7 +221,123 @@ pub fn transmute_matrix(
         experts,
         bias,
         mean_input: mean,
+        pq_codebook,
     })
+}
+
+/// Build micro-experts with ternary quantization (the default M1–M7 path).
+/// Each expert's member rows are ternary-quantized (`{-1,0,1}` + per-row
+/// scale); `pq` is `None` so the kernel dispatches to the ternary path.
+fn build_ternary_experts(
+    cluster_res: &crate::cluster::ClusterResult,
+    residual: &Matrix,
+    residual_row_ids: &[u32],
+    in_dim: usize,
+    mean: &[f32],
+    n_experts: usize,
+) -> Vec<MicroExpert> {
+    let mut experts = Vec::with_capacity(n_experts);
+    for (k, members) in cluster_res.members.iter().enumerate() {
+        let row_ids: Vec<u32> = members
+            .iter()
+            .map(|&r| residual_row_ids[r])
+            .collect();
+        // Build a local matrix of the member rows for quantization.
+        let mut block = Matrix::zeros(members.len(), in_dim);
+        for (i, &r) in members.iter().enumerate() {
+            block.data[i * in_dim..(i + 1) * in_dim]
+                .copy_from_slice(&residual.data[r * in_dim..(r + 1) * in_dim]);
+        }
+        let (ternary, row_scales) = quantize_matrix(&block);
+        // Centroid from k-means (already in input space).
+        let centroid: Vec<f32> =
+            cluster_res.centroids.data[k * in_dim..(k + 1) * in_dim].to_vec();
+        experts.push(MicroExpert {
+            row_ids,
+            ternary,
+            row_scales,
+            centroid,
+            mean_input: mean.to_vec(),
+            pq: None,
+        });
+    }
+    experts
+}
+
+/// Build micro-experts with Product Quantization + a shared layer-level
+/// codebook (Phase 7 / M8 sparse-quality recovery path).
+///
+/// Per-row scale `s = mean(|w|)` captures magnitude exactly; the codebook is
+/// trained on the normalized rows `w / s` so it only needs to represent
+/// shape. Each expert stores its rows' PQ codes + scales; the shared
+/// codebook is returned separately and stored on `SparseLayer::pq_codebook`.
+fn build_pq_experts(
+    cluster_res: &crate::cluster::ClusterResult,
+    residual: &Matrix,
+    residual_row_ids: &[u32],
+    in_dim: usize,
+    mean: &[f32],
+    n_experts: usize,
+    num_sub_vectors_req: usize,
+    nbits: usize,
+    iters: usize,
+    seed: u64,
+) -> anyhow::Result<(Vec<MicroExpert>, nse_core::sparse::PqCodebook)> {
+    let n_residual = residual.rows;
+    if n_residual == 0 {
+        anyhow::bail!("PQ requires at least one residual row to train the codebook");
+    }
+    // `in_dim` must be divisible by `M`; fall back to the largest divisor
+    // <= the request (or M=1 = plain VQ if `in_dim` is prime / no divisor).
+    let m = (1..=num_sub_vectors_req)
+        .rev()
+        .find(|&m| in_dim % m == 0)
+        .unwrap_or(1);
+
+    // Per-row scale = mean(|w|); normalized rows = w / scale (codebook shape).
+    let mut scales: Vec<f32> = Vec::with_capacity(n_residual);
+    let mut normalized: Vec<Vec<f32>> = Vec::with_capacity(n_residual);
+    for r in 0..n_residual {
+        let row = &residual.data[r * in_dim..(r + 1) * in_dim];
+        let scale = row.iter().map(|v| v.abs()).sum::<f32>() / in_dim.max(1) as f32;
+        let s = scale.max(1e-8); // avoid div-by-zero on near-zero rows
+        scales.push(scale);
+        normalized.push(row.iter().map(|&v| v / s).collect());
+    }
+
+    // Train one shared codebook on the normalized residual rows.
+    let codebook = train_pq(&normalized, m, nbits, iters, seed);
+
+    // Encode each expert's member rows against the shared codebook.
+    let mut experts = Vec::with_capacity(n_experts);
+    for (k, members) in cluster_res.members.iter().enumerate() {
+        let row_ids: Vec<u32> = members
+            .iter()
+            .map(|&r| residual_row_ids[r])
+            .collect();
+        let mut codes: Vec<u8> = Vec::with_capacity(members.len() * m);
+        let mut row_scales: Vec<f32> = Vec::with_capacity(members.len());
+        for &r in members {
+            row_scales.push(scales[r]);
+            let row_codes = encode_pq(&normalized[r], &codebook);
+            codes.extend_from_slice(&row_codes);
+        }
+        let centroid: Vec<f32> =
+            cluster_res.centroids.data[k * in_dim..(k + 1) * in_dim].to_vec();
+        experts.push(MicroExpert {
+            row_ids,
+            ternary: vec![],     // unused on the PQ path
+            row_scales: vec![],  // unused on the PQ path (PQ has its own)
+            centroid,
+            mean_input: mean.to_vec(),
+            pq: Some(PqExpertData {
+                codes,
+                row_scales,
+                num_sub_vectors: m,
+            }),
+        });
+    }
+    Ok((experts, codebook))
 }
 
 /// Collect mean input activations for each transmuted weight, averaged over a
@@ -293,5 +475,143 @@ mod tests {
         let tm2 = load_transmuted(&path).unwrap();
         assert_eq!(tm2.config, tm.config);
         assert_eq!(tm2.token_embed, tm.token_embed);
+    }
+
+    /// PQ path: `transmute` with `QuantSchemeConfig::Pq` produces a
+    /// `TransmutedModel` where every non-empty layer has `pq_codebook: Some`
+    /// and every expert has `pq: Some` (no expert left on the ternary path
+    /// by accident). Covered-rows invariant still holds, and the bias is
+    /// still zeroed on core rows (scheme-agnostic).
+    #[test]
+    fn transmute_pq_roundtrip() {
+        let cfg = Config {
+            vocab_size: 16,
+            dim: 32,
+            num_layers: 1,
+            num_heads: 2,
+            max_seq_len: 8,
+            ff_dim: 64,
+        };
+        let lm = ToyLm::init_random(cfg, 7);
+        let tcfg = TransmuteConfig::pq();
+        let tm = transmute(&lm, None, &tcfg).unwrap();
+
+        // dim=32 is divisible by M=4 → sub_dim=8 (no fallback).
+        for layer in &tm.layers {
+            for sl in layer {
+                // Covered-rows invariant: scheme-agnostic.
+                assert_eq!(sl.covered_rows(), sl.out_dim,
+                    "PQ: covered rows must equal out_dim");
+                // Bias still zeroed on core rows (uses original W, not quant).
+                for &r in &sl.core_row_ids {
+                    assert_eq!(sl.bias[r as usize], 0.0, "PQ: core-row bias must be 0");
+                }
+                // If the layer has any experts, the codebook must be present.
+                if !sl.experts.is_empty() {
+                    let cb = sl.pq_codebook.as_ref()
+                        .expect("PQ layer must have a shared codebook");
+                    assert_eq!(cb.num_sub_vectors, 4, "PQ M should be 4 for dim 32/ff 64");
+                    assert_eq!(cb.nbits, 8, "PQ nbits should be 8");
+                    // sub_dim = in_dim / M; the 4 matmuls have different
+                    // in_dims (qkv/attn_out/ff_up feed `dim`, ff_down feeds
+                    // `ff_dim`), so check consistency rather than hardcoding.
+                    assert_eq!(cb.sub_dim, sl.in_dim / cb.num_sub_vectors,
+                        "PQ sub_dim must equal in_dim / M");
+                    assert_eq!(
+                        cb.codebook.len(),
+                        cb.num_sub_vectors * cb.num_entries() * cb.sub_dim,
+                        "PQ codebook size"
+                    );
+                    for e in &sl.experts {
+                        let pq = e.pq.as_ref()
+                            .expect("PQ layer experts must have pq: Some");
+                        assert_eq!(pq.num_sub_vectors, 4, "expert num_sub_vectors");
+                        assert_eq!(
+                            pq.codes.len(),
+                            e.row_ids.len() * 4,
+                            "PQ codes length = rows * M"
+                        );
+                        assert_eq!(
+                            pq.row_scales.len(),
+                            e.row_ids.len(),
+                            "PQ row_scales length = rows"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// PQ save → load roundtrip preserves the codebook + expert codes
+    /// (serde backward-compat: the `#[serde(default)] Option` fields survive
+    /// the JSON roundtrip).
+    #[test]
+    fn transmute_pq_save_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tm_pq.json");
+        let cfg = Config {
+            vocab_size: 16,
+            dim: 32,
+            num_layers: 1,
+            num_heads: 2,
+            max_seq_len: 8,
+            ff_dim: 64,
+        };
+        let lm = ToyLm::init_random(cfg, 7);
+        let tm = transmute(&lm, None, &TransmuteConfig::pq()).unwrap();
+        save_transmuted(&tm, &path).unwrap();
+        let tm2 = load_transmuted(&path).unwrap();
+
+        // Spot-check: codebooks + a few experts match exactly.
+        for (l, (la, lb)) in tm.layers.iter().zip(tm2.layers.iter()).enumerate() {
+            for (m, (sa, sb)) in la.iter().zip(lb.iter()).enumerate() {
+                assert_eq!(sa.pq_codebook, sb.pq_codebook,
+                    "PQ codebook mismatch at layer {l} matmul {m}");
+                assert_eq!(sa.experts.len(), sb.experts.len());
+                for (e1, e2) in sa.experts.iter().zip(sb.experts.iter()) {
+                    assert_eq!(e1.pq, e2.pq, "PQ expert data mismatch");
+                }
+            }
+        }
+    }
+
+    /// `in_dim` not divisible by the requested `M` falls back to the largest
+    /// divisor `<= M`. `dim=30` (divisors ≤4: {1,2,3}) → `M=3, sub_dim=10`;
+    /// `ff_dim=60` (divisible by 4) → stays `M=4, sub_dim=15`. Tests the
+    /// geometry fallback so the CLI doesn't panic on odd dims.
+    #[test]
+    fn transmute_pq_fallback_m_for_undivisible_in_dim() {
+        let cfg = Config {
+            vocab_size: 12,
+            dim: 30,        // not divisible by 4; largest divisor ≤4 is 3
+            num_layers: 1,
+            num_heads: 2,
+            max_seq_len: 8,
+            ff_dim: 60,     // divisible by 4 → stays M=4
+        };
+        let lm = ToyLm::init_random(cfg, 7);
+        let tcfg = TransmuteConfig {
+            outlier: OutlierConfig { fraction: 0.1 },
+            cluster: ClusterConfig { num_experts: 0, iters: 10, seed: 7 },
+            quant: QuantSchemeConfig::Pq {
+                num_sub_vectors: 4,
+                nbits: 8,
+                iters: 10,
+                seed: 7,
+            },
+        };
+        let tm = transmute(&lm, None, &tcfg).unwrap();
+        // qkv/attn_out/ff_up feed dim=30 → fallback to M=3 (sub_dim=10).
+        let sl_qkv = &tm.layers[0][0];
+        if let Some(cb) = &sl_qkv.pq_codebook {
+            assert_eq!(cb.num_sub_vectors, 3, "dim=30 should fall back to M=3");
+            assert_eq!(cb.sub_dim, 10);
+        }
+        // ff_down feeds ff_dim=60 → stays M=4 (sub_dim=15).
+        let sl_ff_down = &tm.layers[0][3];
+        if let Some(cb) = &sl_ff_down.pq_codebook {
+            assert_eq!(cb.num_sub_vectors, 4, "ff_dim=60 should keep M=4");
+            assert_eq!(cb.sub_dim, 15);
+        }
     }
 }

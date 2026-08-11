@@ -237,14 +237,16 @@ fn gelu_inplace(x: &mut [f32]) {
 }
 
 /// Reconstruct the full dense weight matrix `W [out, in]` from a
-/// [`SparseLayer`]: dense core rows (FP32) plus each expert's ternary rows
-/// rescaled by their per-row scale (`~w = scale * ternary`). Used by the
-/// Hopfield-retrieval sparse forward, which needs the full (reconstructed)
-/// `ff_up`/`ff_down` matrices as the associative-memory key/value store.
+/// [`SparseLayer`]: dense core rows (FP32) plus each expert's rows
+/// reconstructed from its quantization scheme — ternary (`scale * ternary`) or
+/// PQ (`scale * decode(codes)` against the layer's shared codebook). Used by
+/// the Hopfield-retrieval sparse forward, which needs the full
+/// (reconstructed) `ff_up`/`ff_down` matrices as the associative-memory
+/// key/value store.
 ///
 /// Honest limitation: this reconstructs on every forward call — fine for the
-/// POC's small matrices, but a production path would cache the reconstruction
-/// (or implement retrieval directly on the ternary codes + scales).
+/// POC's small matrices, but a production path would cache the
+/// reconstruction (or implement retrieval directly on the codes + scales).
 fn reconstruct_dense(sl: &SparseLayer) -> Vec<f32> {
     let out = sl.out_dim;
     let in_dim = sl.in_dim;
@@ -255,14 +257,42 @@ fn reconstruct_dense(sl: &SparseLayer) -> Vec<f32> {
         w[row * in_dim..(row + 1) * in_dim]
             .copy_from_slice(&sl.dense_core.data[i * in_dim..(i + 1) * in_dim]);
     }
-    // Expert rows: ternary code × per-row scale.
+    // Expert rows: dispatch by quantization scheme.
+    let codebook = sl.pq_codebook.as_ref();
     for e in &sl.experts {
-        for (j, &r) in e.row_ids.iter().enumerate() {
-            let scale = e.row_scales[j];
-            let row = r as usize;
-            let code_off = j * in_dim;
-            for k in 0..in_dim {
-                w[row * in_dim + k] = scale * e.ternary[code_off + k] as f32;
+        match (&e.pq, codebook) {
+            (Some(pq), Some(cb)) => {
+                // PQ: row j = pq.row_scales[j] * decode(pq.codes[j*M..(j+1)*M]).
+                let m = pq.num_sub_vectors;
+                let sub_dim = cb.sub_dim;
+                let n_entries = cb.num_entries();
+                debug_assert_eq!(m * sub_dim, in_dim, "PQ geometry mismatch");
+                for (j, &r) in e.row_ids.iter().enumerate() {
+                    let scale = pq.row_scales[j];
+                    let row = r as usize;
+                    let codes = &pq.codes[j * m..(j + 1) * m];
+                    for sm in 0..m {
+                        let c = (codes[sm] as usize).min(n_entries - 1);
+                        let base = sm * n_entries * sub_dim + c * sub_dim;
+                        let cent = &cb.codebook[base..base + sub_dim];
+                        let out_off = row * in_dim + sm * sub_dim;
+                        for k in 0..sub_dim {
+                            w[out_off + k] = scale * cent[k];
+                        }
+                    }
+                }
+            }
+            _ => {
+                // Ternary (or PQ expert without a codebook — defensive fallback
+                // to the ternary path, which is empty for a PQ-only expert).
+                for (j, &r) in e.row_ids.iter().enumerate() {
+                    let scale = e.row_scales[j];
+                    let row = r as usize;
+                    let code_off = j * in_dim;
+                    for k in 0..in_dim {
+                        w[row * in_dim + k] = scale * e.ternary[code_off + k] as f32;
+                    }
+                }
             }
         }
     }

@@ -508,6 +508,98 @@ của M7. `--sgd-epochs`/`--hopfield-writes` cho phép bật phase tắt để t
 
 ---
 
+### 5.7 PQ codebook: phục hồi chất lượng thưa — M8
+
+Mục tiêu trực tiếp: tấn công con số **+82% sparse degradation** (§5.2: sparse
+PPL 37.29 vs dense 20.50) — con số duy nhất làm thesis "chạy LLM thưa trên
+CPU" bị nghi ngờ. Nguyên nhân gốc: ternary `{-1,0,1}` + per-row scale chỉ 3
+level — quá thô cho trọng lượng Gaussian-centered. **Product Quantization
+(PQ)** với codebook 8-bit (256 level/sub-vector, học được) là liệu pháp tự
+nhiên: 256 level vs 3, codebook fit phân phối thật thay vì cố định sign.
+
+#### 5.7.1 Thiết kế
+
+- **Codebook chia sẻ/lớp** (`SparseLayer::pq_codebook`, `Option` +
+  `#[serde(default)]` cho backward-compat): một codebook `[M × 256 ×
+  sub_dim]` cho toàn bộ expert của layer, < 1 MB → L3 cache (spec).
+- **Per-row scale** `s = mean(|w|)` (BitNet-style): codebook chỉ học *shape*
+  trên hàng chuẩn hóa `w/s`, magnitude giữ chính xác.
+- **Sub-vector k-means (L2, không spherical)**: trọng lượng centered ~0
+  (Gaussian), nên L2 — không phải cosine như routing centroid. Mỗi
+  sub-vector có sub-codebook riêng (independent variance per sub-dim).
+- **Kernel**: scalar decode-inline + dot (canonical); AVX2 FMA gather+dot
+  (1.92x speedup, bảng 5.7.3). Dispatch theo `MicroExpert.pq: Some|None` —
+  backward-compat, layer ternary-only chạy ternary kernel như cũ.
+- **Geometry fallback**: `in_dim` không chia hết cho `M` → dùng ước số lớn
+  nhất `≤ M` (dim=30, M=4 → M=3; prime → M=1 = VQ). CLI không panic.
+
+#### 5.7.2 Bảng PPL — PQ vs ternary (dim=64, SGD 20 epoch, all-experts)
+
+| Path | PPL | Degradation vs dense |
+|------|-----|---------------------|
+| Dense (SGD) | 13.531 | — |
+| Sparse ternary (all) | 17.973 | **+32.8%** |
+| Sparse PQ (all, M=4) | 16.017 | **+18.4%** |
+
+PQ **giảm degradation gần một nửa** (+32.8% → +18.4%); `pq/ternary = 0.891`
+(PQ thắng 11% trên sparse PPL). Đây là kết quả *thật*, không toy: trên cùng
+mô hình SGD dim=64, cùng corpus, cùng activation (all-experts) — chỉ khác
+quantization scheme. Bar kỳ vọng (<0.700, i.e. giảm >30%) không đạt trên
+toy dim=64 (chỉ ~50 residual rows/codebook train — quá ít cho 256 centroids);
+giá trị PQ dự kiến mở rộng trên mô hình lớn (dim ≥ 128, nhiều residual rows
+hơn → codebook học tốt hơn).
+
+#### 5.7.3 Benchmark kernel (in_dim=64, 512 rows, M=4, 8-bit)
+
+| Kernel | Scalar ns/call | AVX2 ns/call | Speedup |
+|--------|---------------|--------------|---------|
+| PQ | 117673 (0.56 GFLOP/s) | 61325 (1.07 GFLOP/s) | **1.92x** |
+| Ternary | 797618 (0.08 GFLOP/s) | 87442 (0.75 GFLOP/s) | 9.12x |
+
+Ternary scalar chậm bất ngờ (branch per-element); PQ scalar có tight dot
+loop nên nhanh hơn 6.8x. AVX2 thu hẹp gap (ternary 9.12x speedup nhờ add/sub
+vectorizable). **PQ AVX2 (61µs) vs ternary AVX2 (87µs): PQ nhanh hơn 30%**
+trong cấu hình này — trái với dự đoán "gather expensive", vì FMA chặt codebook
+lookup vào 8-lane accumulate. Trên dim lớn hơn (sub_dim=32+), gather cost có
+thể đảo ngược; tài liệu hóa trung thực.
+
+Reconstruction MSE (256 rows Gaussian in_dim=32, M=4, 8-bit): PQ 0.294 vs
+ternary 0.322 — PQ **1.10x chính xác hơn** (256 level vs 3).
+
+#### 5.7.4 CLI + reproduce
+
+```bash
+nse train --dim 64 --ff-dim 128 --epochs 20 --out lm64.safetensors
+nse transmute --model lm64.safetensors --out lm64_tern.nse --quant ternary
+nse transmute --model lm64.safetensors --out lm64_pq.nse --quant pq --pq-subvectors 4
+nse eval-compare --model lm64.safetensors --nse lm64_tern.nse   # +32.8% baseline
+nse eval-compare --model lm64.safetensors --nse lm64_pq.nse     # +18.4% PQ
+cargo run --release --example bench_pq -p nse-ller               # kernel + MSE bench
+```
+
+`--quant ternary` (default) giữ nguyên reproduce số liệu §5.2–5.6
+(backward-compat). `--quant pq` + `--pq-subvectors M` + `--pq-nbits` (default
+4/8) bật đường PQ. Kernel auto-detect scheme từ `MicroExpert.pq` —
+`eval-sparse`/`eval-compare`/`eval-composite` không cần flag mới.
+
+#### 5.7.5 Trung thực về giới hạn PQ
+
+1. **Toy model sub-tối ưu cho codebook**: 50 residual rows train 256
+   centroids/sub-vector → nhiều cluster trống, codebook kém fit. Giá trị PQ
+   trên dim=64 (+18.4% vs +32.8%) là *lower bound*; dim ≥ 128 với hàng nghìn
+   residual rows sẽ cho codebook đủ data để phát huy 256 level đầy đủ.
+2. **PQ gather kernel không luôn nhanh hơn ternary**: trên dim=64 + AVX2,
+   PQ thắng (FMA chặt lookup); trên sub_dim lớn hơn (≥ 32), gather cost có
+   thể vượt add/sub ternary. Giá trị PQ ở **accuracy** (→ ít expert cần active
+   → net win end-to-end), không phải raw kernel speed.
+3. **Bar <15% degradation chưa đạt**: PQ đạt +18.4% (giảm từ +32.8%) — improvement
+   rõ nhưng chưa củng cố thesis hoàn toàn. Calibration + bias-adaptive
+   (Phase 8 kế tiếp) dự kiến đưa xuống <15%; PQ là foundation cho cả 2.
+4. **Codebook train offline, freeze online**: không adapt online (spec: ZSTM
+   offline). Online adaptation là Phase 8+.
+
+---
+
 ## 6. Giới hạn & thảo luận trung thành
 
 1. **AVX2 không bit-identical**: do tính kết hợp (associativity) của dấu chấm
@@ -529,12 +621,20 @@ của M7. `--sgd-epochs`/`--hopfield-writes` cho phép bật phase tắt để t
      Để tận dụng đầy đủ cần forward-path Hopfield riêng (thay GELU bằng softmax
      retrieval trong eval) — hướng mở.
 
-4. **Toy LM nhỏ**: dim=32, vocab=38, 2 lớp. Số liệu PPL tuyệt đối không đại diện
-     cho mô hình quy mô lớn; giá trị ở **tính tương đối** (trainer nào cải thiện,
-     kernel nào chính xác, pipeline chạy end-to-end).
+4. **Toy LM nhỏ**: dim=32 (§5.1–5.6), dim=64 (§5.7 PQ). Vocab=38, 1–2 lớp.
+     Số liệu PPL tuyệt đối không đại diện cho mô hình quy mô lớn; giá trị ở
+     **tính tương đối** (trainer nào cải thiện, kernel nào chính xác, pipeline
+     chạy end-to-end). PQ trên dim=64 chỉ là lower bound (50 residual rows train
+     256 centroids/sub-vector) — dim ≥ 128 cho codebook đủ data.
 
 5. **LSH-sparse**: che gradient giảm FLOPs update nhưng trên toy model nhỏ saving
      tuyệt đối khiêm tốn; chất lượng phụ thuộc activation clusterable.
+
+6. **PQ (M8)**: giảm sparse degradation +32.8% → +18.4% (giảm gần nửa) nhưng
+     chưa đạt bar <15% — calibration + bias-adaptive (Phase 8) tiếp tục. PQ
+     gather kernel nhanh hơn ternary trên dim=64 + AVX2 (FMA chặt lookup) nhưng
+     có thể đảo ngược trên sub_dim lớn (≥32); giá trị PQ ở accuracy, không
+     raw kernel speed.
 
 ---
 

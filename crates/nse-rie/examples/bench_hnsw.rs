@@ -40,6 +40,7 @@ fn main() {
                 row_scales: vec![1.0],
                 centroid: c.clone(),
                 mean_input: vec![0.0; dim],
+                pq: None,
             })
             .collect();
 

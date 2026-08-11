@@ -376,6 +376,7 @@ mod tests {
             row_scales: vec![0.0],
             centroid: centroid.to_vec(),
             mean_input: vec![0.0; centroid.len()],
+            pq: None,
         }
     }
 

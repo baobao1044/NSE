@@ -21,7 +21,7 @@
 //! remains the canonical ground truth; `KernelKind::Scalar` selects it.
 
 use core::arch::x86_64::*;
-use nse_core::sparse::MicroExpert;
+use nse_core::sparse::{MicroExpert, PqCodebook};
 
 /// Selects which compute kernel the runtime uses for a sparse linear.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +194,82 @@ pub fn compute_dense_core_dispatch(
     crate::kernel::compute_dense_core(core, row_ids, x, y);
 }
 
+/// AVX2 (FMA) PQ micro-expert kernel. For each owned row, decode its `M`
+/// PQ codes (gather the indexed centroids from the shared codebook) and dot
+/// the reconstruction with `x`. The dot product uses FMA over 8-lane chunks;
+/// the codebook gather is scalar (centroids are contiguous in `codebook`, so
+/// a plain slice load is enough — no `_mm256_i32gather_ps` needed). The tail
+/// (< 8 per sub-vector) is folded in scalar order. Not bit-identical to the
+/// scalar kernel (FMA non-associativity), within `~1e-5`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+pub unsafe fn compute_pq_micro_expert_avx2(
+    expert: &MicroExpert,
+    x: &[f32],
+    y: &mut [f32],
+    codebook: &PqCodebook,
+) {
+    let pq = match &expert.pq {
+        Some(p) => p,
+        None => return,
+    };
+    let m = pq.num_sub_vectors;
+    let sub_dim = codebook.sub_dim;
+    let n_entries = codebook.num_entries();
+    for i in 0..pq.row_scales.len() {
+        let rid = expert.row_ids[i] as usize;
+        let scale = pq.row_scales[i];
+        let codes = &pq.codes[i * m..(i + 1) * m];
+        let mut total = 0.0f32;
+        for sm in 0..m {
+            let c = (codes[sm] as usize).min(n_entries - 1);
+            let base = sm * n_entries * sub_dim + c * sub_dim;
+            let cent = &codebook.codebook[base..base + sub_dim];
+            let xsub = &x[sm * sub_dim..(sm + 1) * sub_dim];
+            let mut acc = _mm256_setzero_ps();
+            let mut j = 0;
+            while j + 8 <= sub_dim {
+                let cv = _mm256_loadu_ps(cent.as_ptr().add(j));
+                let xv = _mm256_loadu_ps(xsub.as_ptr().add(j));
+                acc = _mm256_fmadd_ps(cv, xv, acc);
+                j += 8;
+            }
+            // Reduce + scalar tail (same order as the scalar kernel).
+            let mut tmp = [0f32; 8];
+            _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
+            let mut s = tmp[0] + tmp[1] + tmp[2] + tmp[3]
+                + tmp[4] + tmp[5] + tmp[6] + tmp[7];
+            while j < sub_dim {
+                s += cent[j] * xsub[j];
+                j += 1;
+            }
+            total += s;
+        }
+        y[rid] += scale * total;
+    }
+}
+
+/// Dispatch to AVX2 if available, else fall back to scalar (PQ kernel).
+pub fn compute_pq_micro_expert_dispatch(
+    expert: &MicroExpert,
+    x: &[f32],
+    y: &mut [f32],
+    codebook: &PqCodebook,
+    kind: KernelKind,
+) {
+    if kind.use_avx2() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                // SAFETY: guarded by runtime feature detection.
+                unsafe { compute_pq_micro_expert_avx2(expert, x, y, codebook) };
+                return;
+            }
+        }
+    }
+    crate::kernel::compute_pq_micro_expert_scalar(expert, x, y, codebook);
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use super::*;
@@ -226,6 +302,7 @@ mod tests {
             row_scales,
             centroid: vec![0.0; in_dim],
             mean_input: vec![0.0; in_dim],
+            pq: None,
         };
 
         let mut y_scalar = vec![0.0f32; 2];
@@ -253,6 +330,7 @@ mod tests {
             row_scales: vec![1.0],
             centroid: vec![0.0; 3],
             mean_input: vec![0.0; 3],
+            pq: None,
         };
         let x = vec![1.0, 2.0, 3.0];
         let mut y = vec![0.0f32; 1];
@@ -284,6 +362,61 @@ mod tests {
             assert!(
                 (y_s[r] - y_a[r]).abs() <= 1e-4 * y_s[r].abs().max(1.0),
                 "row {r}: scalar={} avx2={}",
+                y_s[r],
+                y_a[r]
+            );
+        }
+    }
+
+    /// PQ AVX2 kernel matches the scalar PQ kernel within FP tolerance (FMA
+    /// non-associativity). Uses a codebook with sub_dim a multiple of 8 so
+    /// the FMA path is fully exercised (no tail).
+    #[test]
+    fn pq_avx2_matches_scalar() {
+        if !supports_avx2() {
+            eprintln!("AVX2 unavailable, skipping PQ AVX2 test");
+            return;
+        }
+        use nse_core::sparse::PqCodebook;
+        use nse_core::sparse::PqExpertData;
+        // M=2 sub-vectors of dim 8 (= in_dim 16), 4 entries each (nbits=2).
+        let m = 2;
+        let sub_dim = 8;
+        let n_entries = 4;
+        let codebook = PqCodebook {
+            num_sub_vectors: m,
+            nbits: 2,
+            sub_dim,
+            codebook: (0..(m * n_entries * sub_dim))
+                .map(|i| (i as f32) * 0.01 - 0.05)
+                .collect(),
+        };
+        let n_rows = 3;
+        let codes: Vec<u8> = (0..n_rows * m).map(|i| (i as u8) % n_entries as u8).collect();
+        let row_scales: Vec<f32> = (0..n_rows).map(|i| 0.1 + (i as f32) * 0.3).collect();
+        let expert = MicroExpert {
+            row_ids: (0..n_rows as u32).collect(),
+            ternary: vec![],
+            row_scales: vec![],
+            centroid: vec![0.0; m * sub_dim],
+            mean_input: vec![0.0; m * sub_dim],
+            pq: Some(PqExpertData {
+                codes,
+                row_scales,
+                num_sub_vectors: m,
+            }),
+        };
+        let x: Vec<f32> = (0..m * sub_dim).map(|i| (i as f32) * 0.1).collect();
+
+        let mut y_s = vec![0.0f32; n_rows];
+        crate::kernel::compute_pq_micro_expert_scalar(&expert, &x, &mut y_s, &codebook);
+        let mut y_a = vec![0.0f32; n_rows];
+        unsafe { compute_pq_micro_expert_avx2(&expert, &x, &mut y_a, &codebook) };
+
+        for r in 0..n_rows {
+            assert!(
+                (y_s[r] - y_a[r]).abs() <= 1e-5 * y_s[r].abs().max(1.0),
+                "PQ row {r}: scalar={} avx2={}",
                 y_s[r],
                 y_a[r]
             );

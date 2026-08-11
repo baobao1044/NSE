@@ -17,4 +17,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 nse-zstm.workspace = true
+nse-train.workspace = true
 tempfile = "3"
