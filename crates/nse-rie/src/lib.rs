@@ -34,8 +34,9 @@ pub use nse_ller::KernelKind;
 
 use nse_core::sparse::SparseLayer;
 use nse_ller::{
-    apply_bias as ller_apply_bias, compute_dense_core_dispatch,
-    compute_pq_micro_expert_dispatch, compute_ternary_micro_expert_dispatch,
+    apply_bias as ller_apply_bias, apply_bias_pruned_only as ller_apply_bias_pruned_only,
+    compute_dense_core_dispatch, compute_pq_micro_expert_dispatch,
+    compute_ternary_micro_expert_dispatch,
 };
 
 /// Which MIPS backend to use for expert routing.
@@ -119,8 +120,43 @@ pub fn sparse_linear_with_kernel(
             }
         }
     }
-    // Static bias (compensates pruned experts on average).
-    ller_apply_bias(&sl.bias, &mut y);
+    // Bias application — dispatch by mode:
+    // - empty `row_to_expert`  → legacy (unconditional add; reproduces M8).
+    // - non-empty + no table   → pruned-only mean-input bias (S1 correctness fix).
+    // - non-empty + table      → adaptive per-token bias (S4; handled below).
+    if sl.row_to_expert.is_empty() {
+        // Legacy: unconditional add to every output row.
+        ller_apply_bias(&sl.bias, &mut y);
+    } else {
+        // Build the activated-expert boolean mask (size n_experts).
+        let mut activated_set = vec![false; sl.experts.len()];
+        for &eid in activated {
+            if eid < activated_set.len() {
+                activated_set[eid] = true;
+            }
+        }
+        // Adaptive (S4): if a per-token bias table + activation codebook are
+        // present, encode `x` and look up per-code bias for pruned rows;
+        // otherwise fall back to the fixed mean-input bias for pruned rows.
+        let used_adaptive = match (&sl.bias_table, &sl.input_codebook) {
+            (Some(table), Some(cb)) => {
+                crate::bias::apply_adaptive(
+                    table,
+                    &mut y,
+                    &sl.row_to_expert,
+                    &activated_set,
+                    x,
+                    cb,
+                    sl.out_dim,
+                );
+                true
+            }
+            _ => false,
+        };
+        if !used_adaptive {
+            ller_apply_bias_pruned_only(&sl.bias, &mut y, &sl.row_to_expert, &activated_set);
+        }
+    }
     y
 }
 
@@ -172,6 +208,11 @@ mod tests {
             bias,
             mean_input: vec![0.0; in_dim],
             pq_codebook: None,
+            // Legacy mode (empty) so existing tests keep the unconditional
+            // bias-add behavior they were written against.
+            row_to_expert: Vec::new(),
+            input_codebook: None,
+            bias_table: None,
         }
     }
 
@@ -196,5 +237,148 @@ mod tests {
         // y[0] = core = 1*2 = 2 ; y[1] = bias only = 7 (expert pruned)
         assert!((y[0] - 2.0).abs() < 1e-5);
         assert!((y[1] - 7.0).abs() < 1e-5);
+    }
+
+    /// Phase 8 / S1 correctness fix: when `row_to_expert` is non-empty the bias
+    /// is applied **pruned-only**, not unconditionally. An activated expert
+    /// row must NOT receive the bias (no double-count of the mean-input term);
+    /// a pruned expert row DOES receive it; a core row never does.
+    #[test]
+    fn bias_pruned_only_no_double_count() {
+        // 2-expert layer: core owns row 0, expert 0 owns row 1, expert 1 owns row 2.
+        // Both experts activated → row 1 & row 2 computed; none should get bias.
+        let in_dim = 3;
+        let dense_core = Matrix {
+            rows: 1,
+            cols: in_dim,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        let e0 = MicroExpert {
+            row_ids: vec![1],
+            ternary: vec![1, -1, 0],
+            row_scales: vec![2.0],
+            centroid: vec![1.0; in_dim],
+            mean_input: vec![0.0; in_dim],
+            pq: None,
+        };
+        let e1 = MicroExpert {
+            row_ids: vec![2],
+            ternary: vec![0, 1, -1],
+            row_scales: vec![1.5],
+            centroid: vec![1.0; in_dim],
+            mean_input: vec![0.0; in_dim],
+            pq: None,
+        };
+        // Non-zero bias on the expert rows (simulating a real-corpus mean).
+        let mut bias = vec![0.0f32; 3];
+        bias[1] = 100.0; // would double-count if added to activated e0 row
+        bias[2] = 200.0; // would double-count if added to activated e1 row
+        // row_to_expert: row 0 → -1 (core), row 1 → 0 (expert 0), row 2 → 1 (expert 1).
+        let row_to_expert = vec![-1i32, 0, 1];
+        let sl = SparseLayer {
+            out_dim: 3,
+            in_dim,
+            dense_core,
+            core_row_ids: vec![0],
+            experts: vec![e0, e1],
+            bias,
+            mean_input: vec![0.0; in_dim],
+            pq_codebook: None,
+            row_to_expert,
+            input_codebook: None,
+            bias_table: None,
+        };
+        let x = vec![0.5, 1.0, 2.0];
+
+        // --- Case A: all experts activated → NO bias added (pruned-only) ---
+        let y_all = sparse_linear(&sl, &x, &[0, 1]);
+        // y[0] = core = 1*.5+2*1+3*2 = 8.5
+        // y[1] = e0 = 2*(+.5 -1.0 +0) = -1.0  (NO +100 bias — no double-count)
+        // y[2] = e1 = 1.5*(0 +1.0 -2.0) = -1.5  (NO +200 bias)
+        assert!((y_all[0] - 8.5).abs() < 1e-5, "core row: {}", y_all[0]);
+        assert!((y_all[1] - (-1.0)).abs() < 1e-5, "e0 row should have NO bias: {}", y_all[1]);
+        assert!((y_all[2] - (-1.5)).abs() < 1e-5, "e1 row should have NO bias: {}", y_all[2]);
+
+        // --- Case B: only expert 0 activated → row 2 (expert 1) pruned → gets bias ---
+        let y_half = sparse_linear(&sl, &x, &[0]);
+        // y[1] = e0 computed = -1.0 (no bias)
+        // y[2] = bias only = 200.0 (expert 1 pruned)
+        assert!((y_half[1] - (-1.0)).abs() < 1e-5, "e0 still no bias when activated: {}", y_half[1]);
+        assert!((y_half[2] - 200.0).abs() < 1e-5, "pruned e1 row should get bias: {}", y_half[2]);
+        // core row unchanged
+        assert!((y_half[0] - 8.5).abs() < 1e-5);
+
+        // --- Case C: no experts activated → both expert rows pruned → both get bias ---
+        let y_none = sparse_linear(&sl, &x, &[]);
+        assert!((y_none[1] - 100.0).abs() < 1e-5, "all-pruned e0 should get bias: {}", y_none[1]);
+        assert!((y_none[2] - 200.0).abs() < 1e-5, "all-pruned e1 should get bias: {}", y_none[2]);
+        assert!((y_none[0] - 8.5).abs() < 1e-5, "core never gets bias: {}", y_none[0]);
+    }
+
+    /// Phase 8 / S4 adaptive bias: when `input_codebook` + `bias_table` are
+    /// present, the bias for a pruned row depends on the token's `x` — two
+    /// different inputs that encode against the activation codebook to
+    /// different codes must produce different bias values for the same
+    /// pruned row. This is the core "per-token, not mean" property.
+    #[test]
+    fn bias_adaptive_depends_on_x() {
+        use nse_core::sparse::PqCodebook;
+        let in_dim = 3;
+        // Two well-separated activation centroids (M=1, nbits=1 → 2 codes).
+        let input_codebook = PqCodebook {
+            num_sub_vectors: 1,
+            nbits: 1,
+            sub_dim: in_dim,
+            codebook: vec![10.0, 0.0, 0.0, -10.0, 0.0, 0.0],
+        };
+        // Dense core owns row 0 (computed exactly, no bias). Expert 0 owns
+        // row 1 (prunable). No experts activated → row 1 gets adaptive bias.
+        let dense_core = Matrix {
+            rows: 1,
+            cols: in_dim,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        let expert = MicroExpert {
+            row_ids: vec![1],
+            ternary: vec![1, -1, 0],
+            row_scales: vec![2.0],
+            centroid: vec![1.0; in_dim],
+            mean_input: vec![0.0; in_dim],
+            pq: None,
+        };
+        let out_dim = 2;
+        // bias_table[c * out_dim + i]: code 0 → bias 5.0 for row 1;
+        // code 1 → bias 50.0 for row 1. Core row 0 left 0 in both codes.
+        let bias_table = vec![
+            0.0, 5.0,  // code 0: row 0 = 0 (core), row 1 = 5.0
+            0.0, 50.0, // code 1: row 0 = 0 (core), row 1 = 50.0
+        ];
+        let row_to_expert = vec![-1i32, 0];
+        let sl = SparseLayer {
+            out_dim,
+            in_dim,
+            dense_core,
+            core_row_ids: vec![0],
+            experts: vec![expert],
+            bias: vec![0.0, 0.0], // legacy mean bias (unused in adaptive mode)
+            mean_input: vec![0.0; in_dim],
+            pq_codebook: None,
+            row_to_expert,
+            input_codebook: Some(input_codebook),
+            bias_table: Some(bias_table),
+        };
+        // x_a = [10, 0, 0] encodes to code 0 (nearest centroid) → bias 5.0.
+        // x_b = [-10, 0, 0] encodes to code 1 → bias 50.0.
+        // No experts activated → row 1 (pruned) gets the adaptive bias.
+        let y_a = sparse_linear(&sl, &[10.0, 0.0, 0.0], &[]);
+        let y_b = sparse_linear(&sl, &[-10.0, 0.0, 0.0], &[]);
+        // Core row 0: 1*10+2*0+3*0 = 10 (x_a), 1*-10 = -10 (x_b).
+        assert!((y_a[0] - 10.0).abs() < 1e-5, "core x_a: {}", y_a[0]);
+        assert!((y_b[0] - (-10.0)).abs() < 1e-5, "core x_b: {}", y_b[0]);
+        // Pruned row 1: adaptive bias depends on x.
+        assert!((y_a[1] - 5.0).abs() < 1e-5, "x_a → code 0 → bias 5.0: {}", y_a[1]);
+        assert!((y_b[1] - 50.0).abs() < 1e-5, "x_b → code 1 → bias 50.0: {}", y_b[1]);
+        // The two pruned-row values MUST differ — the per-token property.
+        assert!((y_a[1] - y_b[1]).abs() > 1e-5, "adaptive bias must depend on x");
     }
 }

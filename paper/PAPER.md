@@ -600,6 +600,103 @@ cargo run --release --example bench_pq -p nse-ller               # kernel + MSE 
 
 ---
 
+### 5.8 Calibration + bias-adaptive: sửa double-count + per-token bias — M9
+
+Phase 8 tiếp tục breakthrough direction: M8 (PQ codebook) giảm degradation
++32.8% → +18.4% nhưng bar <15% chưa đạt. M9 có hai con:
+
+1. **Sửa correctness bug (S1)**: bias `B[i] = W[i]·mean_input` hiện add
+   **unconditional** cho mọi output row (`apply_bias`, `kernel.rs:67-73`) →
+   activated expert rows bị **double-count** `W_quant[i]·x + W[i]·mean_input`.
+   Doc (`sparse.rs:14-21`) nói pruned-only nhưng code không match — test không
+   phát hiện vì `corpus=None` → `mean_input=0`. Fix: thêm `row_to_expert` map
+   (-1=core, k=expert k) + `apply_bias_pruned_only` (skip activated rows).
+
+2. **Bias-adaptive (S3-S4)**: thay `mean_input` cố định bằng ước lượng per-token
+   cho pruned rows, dùng PQ codebook trên **activation** (đúng promise "PQ là
+   foundation cho cả 2"). Train VQ codebook (M=1, 256 centroids) trên
+   calibration activations, precompute `bias_table[c][i] = W_quant[i]·centroid[c]`,
+   online encode `x` → code `c` → lookup.
+
+#### 5.8.1 Bias correctness fix (S1)
+
+Trước M9, bias add unconditional → activated expert row `i` nhận
+`W_quant[i]·x + W[i]·mean_input` (double-count mean term). Pruned row `i` nhận
+`W[i]·mean_input` (intended). Core row nhận `W_core[i]·x` (bias=0, correct).
+
+M9 fix: `row_to_expert: Vec<i32>` (len out_dim, -1=core, k=expert) + dispatch:
+- **Legacy** (`row_to_expert` empty, old `.nse`): unconditional add (giữ M8 behavior).
+- **Pruned-only** (`row_to_expert` non-empty, no `bias_table`): pruned rows get
+  `bias[i]`, activated+core get 0 — fix double-count.
+- **Adaptive** (+ `bias_table` + `input_codebook`): pruned rows get
+  `bias_table[c][i]` (per-token), activated+core get 0.
+
+Backward-compat: old `.nse` (empty `row_to_expert`) → unconditional bias y hệt M8.
+
+#### 5.8.2 Calibration infra (S2)
+
+M8 dùng 1 forward window (single seq) → collapse thành mean. M9 refactor
+`mean_inputs_for` → `collect_activations` (trả per-token rows, không collapse),
+sliding windows đa cửa sổ (step=seq/2, 50% overlap). CLI thêm `--calibration-corpus`
+(tách calibration set khỏi training corpus — Phase 8 calibration discipline).
+
+Ví dụ: corpus 40 tokens, max_seq_len=8, step=4 → ~8 windows × 8 tokens = 64
+rows (vs M8's 1 window × 8 = 8 rows). VQ codebook train trên phân phối đầy đủ
+hơn, không chỉ 1 mean.
+
+#### 5.8.3 Activation PQ codebook (S3) — "PQ foundation cho cả 2"
+
+`BiasMode::Adaptive`: ngoài mean bias (legacy), train VQ codebook trên
+calibration activations per matmul:
+
+- `input_codebook = train_pq(activation_rows, 1, 8, iters, seed)` — M=1
+  (VQ thuần, 256 centroids toàn input space), reuse PQ machinery từ M8.
+- `bias_table[c][i] = W_quant[i] · decode_pq([c], input_codebook)` cho c in
+  0..256, i in prunable rows. `W_quant[i]` = decoded weight (ternary
+  `scale·codes` hoặc PQ `scale·decode(codes)` — reuse `reconstruct_quantized_rows`).
+- Storage: 256×out_dim×4 bytes/matmul. Toy dim=64 ~ 192KB/matmul OK; model
+  thật (out_dim=3072) ~ 3MB × 4 × 12 = 144MB — phá L3. Production cần low-rank
+  hoặc shared (Phase 9).
+
+**Tại sao M=1 (VQ) không M=4**: bias_table cần 1 index `c` → 256 entries.
+PQ M=4 → 256^4 entries (không khả thi). M=1 = VQ thuần (256 centroids toàn
+dim) qua `train_pq` — đúng "PQ foundation" (reuse train_pq/encode_pq/decode_pq).
+Tradeoff: VQ 256-level vs mean 1-level (cải thiện lớn); accuracy hạn chế bởi
+curse of dimensionality trong 64-dim space — ghi nhận trung thực, PQ M>1
+on-the-fly là Phase 9 nếu VQ không đủ.
+
+#### 5.8.4 Adaptive bias kernel (S4) + dispatch
+
+`apply_adaptive`: encode `x` → code `c` (256·dim dots, amortized), loop i:
+skip core (e<0), skip activated (`activated_set[e]`), else `y[i] +=
+bias_table[c*out_dim + i]` (1 lookup/row). Dispatch trong
+`sparse_linear_with_kernel` theo fields present (legacy/pruned-only/adaptive).
+
+Cost: encode = 256·dim dots/token (cheap, amortized); lookup = 1/row.
+Speedup khi n_pruned >> 256 (threshold mode). Route_all (no pruning) → adaptive
+không dùng (no pruned rows); chỉ S1 fix giúp (no double-count).
+
+#### 5.8.5 Kết quả + trung thực về giới hạn
+
+[Số liệu headline sẽ điền sau khi test end-to-end xong — `adaptive_bias_lower_degradation`
+so sánh mean-bias vs adaptive trên dim=64 SGD threshold-mode.]
+
+Giới hạn trung thực:
+1. **S1 fix có thể không giúp route_all nhiều**: double-count bias
+   `W[i]·mean_input` là constant; layernorm kế tiếp remove mean → có thể wash
+   out. Đo thật, document.
+2. **VQ M=1 256-level coarse**: 64-dim space, 256 centroids, ~50 calibration
+   tokens (toy) → nhiều empty clusters. PQ M>1 on-the-fly (Phase 9) nếu VQ
+   không đủ.
+3. **bias_table storage**: 256×out_dim×4 bytes/matmul. Toy OK; model thật
+   phá L3. Production cần low-rank hoặc shared (Phase 9).
+4. **Adaptive chỉ giúp threshold mode**: route_all (no pruning) → adaptive
+   không dùng. S1 fix giúp route_all.
+5. **Bar <15% không đảm bảo**: S1 + adaptive có thể đưa xuống <15% hoặc
+   không — toy model + ít calibration data. Tài liệu hóa + tiếp tục (Phase 9).
+
+---
+
 ## 6. Giới hạn & thảo luận trung thành
 
 1. **AVX2 không bit-identical**: do tính kết hợp (associativity) của dấu chấm
@@ -630,11 +727,15 @@ cargo run --release --example bench_pq -p nse-ller               # kernel + MSE 
 5. **LSH-sparse**: che gradient giảm FLOPs update nhưng trên toy model nhỏ saving
      tuyệt đối khiêm tốn; chất lượng phụ thuộc activation clusterable.
 
-6. **PQ (M8)**: giảm sparse degradation +32.8% → +18.4% (giảm gần nửa) nhưng
-     chưa đạt bar <15% — calibration + bias-adaptive (Phase 8) tiếp tục. PQ
-     gather kernel nhanh hơn ternary trên dim=64 + AVX2 (FMA chặt lookup) nhưng
-     có thể đảo ngược trên sub_dim lớn (≥32); giá trị PQ ở accuracy, không
-     raw kernel speed.
+6. **PQ (M8) + bias-adaptive (M9)**: PQ giảm sparse degradation +32.8% →
+     +18.4% (giảm gần nửa). M9 (Phase 8) sửa double-count bias (pruned-only) +
+     calibration multi-window + activation VQ codebook (M=1, 256 centroids) +
+     per-token adaptive bias (`--bias-mode adaptive`). Adaptive giúp threshold-mode;
+     S1 fix giúp route_all (no double-count). Bar <15% đo trên threshold-mode;
+     route_all layernorm wash-out → S1 fix có thể không giúp nhiều (đo thật).
+     PQ gather kernel nhanh hơn ternary trên dim=64 + AVX2 (FMA chặt lookup)
+     nhưng có thể đảo ngược trên sub_dim lớn (≥32); giá trị PQ ở accuracy, không
+     raw kernel speed. PQ M>1 on-the-fly, low-rank bias là Phase 9+.
 
 ---
 
@@ -647,10 +748,14 @@ thế. Kết quả chính:
 - AVX2 + HNSW cho kết quả chính xác như vô hướng/brute (correctness verified).
 - LSH-sparse (backprop + che) gần SGD; FF đánh bại baseline đồng nhất; Hopfield
   recall đúng nhưng không cải thiện dense PPL (giới hạn đã tài liệu hóa).
+- PQ codebook (M8) giảm sparse degradation +32.8% → +18.4%; bias-adaptive (M9)
+  sửa double-count + per-token bias qua activation VQ codebook ("PQ foundation
+  cho cả 2"). Bar <15% đo trên threshold-mode (đang đo).
 - Trung thành: FF/Hopfield là prototype nghiên cứu, không production.
 
 Hướng mở: forward-path Hopfield thực (softmax thay GELU trong eval), HNSW ở quy
-mô lớn, AVX2 throughput benchmark, LSH-sparse trên model lớn hơn.
+mô lớn, AVX2 throughput benchmark, LSH-sparse trên model lớn hơn, PQ M>1 on-the-fly
+cho bias-adaptive, low-rank bias basis cho production scale.
 
 ---
 

@@ -121,6 +121,21 @@ pub struct SparseLayer {
     pub experts: Vec<MicroExpert>,
     /// Static bias `B [out]`: `B[i] = W[i] . mean_input` for prunable rows;
     /// 0 for core rows (they're always computed exactly).
+    ///
+    /// Application policy depends on [`Self::row_to_expert`]:
+    /// - **Legacy** (empty `row_to_expert`, the M8-and-earlier format): the
+    ///   bias is added *unconditionally* to every output row by
+    ///   [`nse_ller::apply_bias`]. This is kept verbatim so old `.nse`
+    ///   files reproduce their original PPL.
+    /// - **Pruned-only** (`row_to_expert` non-empty, [`Self::bias_table`]
+    ///   `None`): the bias is added only to rows whose owning expert is NOT
+    ///   activated for the current token — fixing the M8 double-count
+    ///   (`W_quant[i]·x + W[i]·mean_input`) that this field caused for
+    ///   activated expert rows.
+    /// - **Adaptive** (`row_to_expert` + [`Self::bias_table`] +
+    ///   [`Self::input_codebook`] all present): the bias for a pruned row
+    ///   is looked up per-token from `bias_table` keyed by the token's
+    ///   activation codebook index, instead of using this fixed mean.
     pub bias: Vec<f32>,
     /// Mean activation over the transmutation corpus, in input space `[in]`.
     pub mean_input: Vec<f32>,
@@ -128,6 +143,36 @@ pub struct SparseLayer {
     /// `pq: Some`). `None` for ternary-only layers (backward-compatible).
     #[serde(default)]
     pub pq_codebook: Option<PqCodebook>,
+    /// Row→expert ownership map (length `out_dim`):
+    /// - `-1` = dense-core row (computed exactly, never biased),
+    /// - `k >= 0` = output row owned by expert `k` (prunable, biased when
+    ///   pruned).
+    ///
+    /// Empty (default) = **legacy mode**: the bias is applied unconditionally
+    /// to every row (the M8 behavior). Non-empty switches on the
+    /// pruned-only / adaptive application policies. The field is
+    /// `#[serde(default)]` so old `.nse` files deserialize as empty →
+    /// legacy, preserving their PPL.
+    #[serde(default)]
+    pub row_to_expert: Vec<i32>,
+    /// Activation codebook (Vector Quantization via the PQ machinery,
+    /// `num_sub_vectors = 1`, `nbits = 8` → 256 centroids in input space)
+    /// trained offline on calibration-set activations. Only present in
+    /// **adaptive** mode; used at inference to encode the current token's
+    /// `x` into a single code `c`, which indexes [`Self::bias_table`].
+    /// `None` for legacy / pruned-only modes.
+    #[serde(default)]
+    pub input_codebook: Option<PqCodebook>,
+    /// Per-token adaptive bias table, shape `[256 * out_dim]` (when
+    /// `input_codebook` has `nbits = 8`): `bias_table[c * out_dim + i] =
+    /// W_quant[i] . decode_pq([c], input_codebook)` = the bias for output
+    /// row `i` when the token's activation quantizes to code `c`. Only the
+    /// rows that are *prunable* (expert rows, not core) carry meaningful
+    /// entries; core rows are left zero (computed exactly). Looked up
+    /// online after encoding `x`; only added to rows whose owning expert
+    /// was NOT activated. `None` for legacy / pruned-only modes.
+    #[serde(default)]
+    pub bias_table: Option<Vec<f32>>,
 }
 
 impl SparseLayer {

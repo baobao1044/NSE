@@ -24,6 +24,6 @@ pub mod quantize;
 pub mod transmuter;
 
 pub use transmuter::{
-    QuantSchemeConfig, TransmuteConfig, load_transmuted, save_transmuted,
-    transmute, transmute_matrix,
+    BiasMode, QuantSchemeConfig, TransmuteConfig, load_transmuted,
+    save_transmuted, transmute, transmute_matrix, transmute_matrix_with_cal,
 };

@@ -23,7 +23,7 @@ minh pipeline huấn luyện → biến đổi thưa → suy luận thưa → đ
 - [Workspace](#workspace)
 - [Build & test](#build--test)
 - [Quickstart](#quickstart)
-- [Trạng thái (Milestones M0-M8)](#trạng-thái-milestones-m0-m8)
+- [Trạng thái (Milestones M0-M9)](#trạng-thái-milestones-m0-m9)
 - [Kết quả POC (Key results)](#kết-quả-poc-key-results)
 - [Giới hạn (Honest limitations)](#giới-hạn-honest-limitations)
 - [Tài liệu](#tài-liệu)
@@ -210,7 +210,7 @@ CLI in 4 chữ số thập phân cho PPL và 2 cho %.)
 
 ---
 
-## Trạng thái (Milestones M0-M8)
+## Trạng thái (Milestones M0-M9)
 
 | MS | Trạng thái | Mô tả | Artifact chính |
 |---|:---:|---|---|
@@ -223,8 +223,9 @@ CLI in 4 chữ số thập phân cho PPL và 2 cho %.)
 | M6 | ✅ | Scaffold AVX2/HNSW + 3 trainer thay thế (FF/Hopfield/LSH-sparse) | AVX2, HNSW, 3 trainer |
 | M7 | ✅ | `CompositeTrainer` (hippocampus+cortex) + sparse Hopfield forward + `eval-composite` 4-path | `CompositeTrainer`, `eval-composite` |
 | M8 | ✅ | PQ codebook thật (per-sub-vector L2 k-means, 8-bit, shared/lớp) + kernel scalar/AVX2 + `--quant pq`; degradation +32.8% → +18.4% (dim=64) | `PqCodebook`, `--quant pq` |
+| M9 | ✅ | Calibration + bias-adaptive: sửa double-count bias (pruned-only) + activation VQ codebook (M=1, 256 centroids) + `--bias-mode adaptive`; per-token bias cho pruned rows | `BiasMode`, `--bias-mode adaptive` |
 
-Tất cả 8 milestone hoàn thành. 56 test pass trên toàn workspace.
+Tất cả 9 milestone hoàn thành. 56+ test pass trên toàn workspace.
 
 ---
 
@@ -291,8 +292,13 @@ là những giới hạn chính:
   codebook đủ data để phát huy 256 level đầy đủ.
 
 - **Bar PQ <15% degradation chưa đạt**: PQ đạt +18.4% (giảm từ +32.8%) — improvement
-  rõ nhưng chưa củng cố thesis hoàn toàn. Calibration + bias-adaptive (Phase 8 kế
-  tiếp) dự kiến đưa xuống <15%; PQ là foundation cho cả hai.
+  rõ nhưng chưa củng cố thesis hoàn toàn. **Phase 8 (M9) đã hoàn tất**: sửa double-count
+  bias (pruned-only) + calibration multi-window + activation VQ codebook (M=1, 256
+  centroids) + per-token adaptive bias (`--bias-mode adaptive`). Adaptive giúp
+  threshold-mode (pruned rows dùng per-token bias); S1 fix giúp route_all (no double-count).
+  Bar <15% đo trên threshold-mode; route_all layernorm wash-out constant bias → S1 fix
+  có thể không giúp nhiều (đo thật, tài liệu hóa). PQ M>1 on-the-fly, low-rank bias là
+  Phase 9+.
 
 - **AVX2 không bit-identical**: do tính kết hợp (associativity) của dấu chấm động,
   kết quả AVX2 khác vô hướng ở mức FP noise. Test trong tolerance 1e-5, tài liệu

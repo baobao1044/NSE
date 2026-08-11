@@ -359,6 +359,7 @@ dependencies = [
  "ndarray",
  "nse-core",
  "nse-ller",
+ "nse-zstm",
  "rand",
  "rayon",
  "thiserror",

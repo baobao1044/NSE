@@ -72,6 +72,42 @@ pub fn apply_bias(bias: &[f32], y: &mut [f32]) {
     }
 }
 
+/// Apply the bias **only to pruned-expert rows** — the correctness fix for
+/// the M8 double-count. For each output row `i`:
+/// - skip if `row_to_expert[i] < 0` (dense-core row — computed exactly,
+///   never biased),
+/// - skip if `activated_set[row_to_expert[i] as usize]` is true (the
+///   owning expert IS activated → its contribution is computed, so the
+///   bias would double-count),
+/// - otherwise (owning expert pruned for this token) add `bias[i]`.
+///
+/// `row_to_expert` is length `out_dim` with `-1` for core rows; `activated_set`
+/// is a boolean mask of length `n_experts`. When `row_to_expert` is empty
+/// the caller must use [`apply_bias`] (legacy unconditional path) instead.
+pub fn apply_bias_pruned_only(
+    bias: &[f32],
+    y: &mut [f32],
+    row_to_expert: &[i32],
+    activated_set: &[bool],
+) {
+    for (i, &e) in row_to_expert.iter().enumerate() {
+        if i >= y.len() {
+            break;
+        }
+        if e < 0 {
+            continue; // core row
+        }
+        let e = e as usize;
+        if e < activated_set.len() && activated_set[e] {
+            continue; // owning expert activated → no bias (avoid double-count)
+        }
+        // Pruned expert row → add the mean-input bias.
+        if i < bias.len() {
+            y[i] += bias[i];
+        }
+    }
+}
+
 /// Scalar reference PQ micro-expert kernel.
 ///
 /// For each owned output row `i` (original id `row_ids[i]`), decode its `M`

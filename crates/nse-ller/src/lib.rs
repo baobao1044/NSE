@@ -23,6 +23,6 @@ pub use avx2::{
     compute_ternary_micro_expert_dispatch, KernelKind,
 };
 pub use kernel::{
-    apply_bias, compute_dense_core, compute_pq_micro_expert_scalar,
-    compute_ternary_micro_expert_scalar,
+    apply_bias, apply_bias_pruned_only, compute_dense_core,
+    compute_pq_micro_expert_scalar, compute_ternary_micro_expert_scalar,
 };

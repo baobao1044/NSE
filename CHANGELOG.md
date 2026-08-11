@@ -21,17 +21,40 @@ mỗi milestone là một giai đoạn nghiên cứu có artifact + kết quả 
 
 ## [Unreleased]
 
-### Added
+### Added — M9: Calibration + bias-adaptive (Phase 8)
 
-- _(chưa có — placeholder cho thay đổi kể từ M8)._
+- **Bias correctness fix (S1)**: `apply_bias` được áp dụng **pruned-only** (chỉ
+  hàng của expert bị prune) thay vì unconditional — sửa double-count
+  `W_quant[i]·x + W[i]·mean_input` cho activated expert rows (bug từ M8,
+  test không phát hiện vì `corpus=None` → `mean_input=0`). Thêm `row_to_expert`
+  map (-1=core, k=expert k) vào `SparseLayer` (`#[serde(default)]` backward-compat).
+- **Calibration infra (S2)**: `collect_activations` thay `mean_inputs_for`,
+  sliding windows đa cửa sổ (step=seq/2, 50% overlap) thay 1 window. CLI
+  thêm `--calibration-corpus` (tách calibration set khỏi training corpus).
+- **Activation PQ codebook (S3)**: `BiasMode::Adaptive` — train VQ codebook
+  (PQ machinery M=1, 256 centroids) trên calibration activations, precompute
+  `bias_table[c][i] = W_quant[i]·centroid[c]`. Đúng promise "PQ là foundation
+  cho cả 2" (weight codebook + activation codebook).
+- **Adaptive bias kernel (S4)**: `apply_adaptive` encode `x` → code `c`, lookup
+  `bias_table[c][i]` cho pruned rows — per-token, không mean. Dispatch 3 mode
+  trong `sparse_linear_with_kernel` (legacy/pruned-only/adaptive).
+- **CLI (S6)**: `--bias-mode mean|adaptive`, `--calibration-corpus`, `--bias-codebook-bits`.
+- **Tests mới (S7)**: `bias_pruned_only_no_double_count` (3 case), `calibration_multi_window`,
+  `activation_pq_bias_table_math` (cross-check decode), `bias_adaptive_depends_on_x`
+  (2 x → 2 bias), `transmute_adaptive_roundtrip` (save/load fields).
 
 ### Changed
 
-- _(chưa có.)_
+- `transmute` thêm param `calibration_corpus: Option<&[u8]>` (None → dùng corpus,
+  backward-compat). `transmute_matrix` → `transmute_matrix_with_cal` (thêm `cal_rows`).
+- `TransmuteConfig` thêm `bias_mode: BiasMode` (default `Mean`, backward-compat).
+- `nse-rie` depends on `nse-zstm` (cho `encode_pq` trong adaptive bias).
 
 ### Fixed
 
-- _(chưa có.)_
+- **Double-count bias bug**: activated expert rows nhận `W_quant[i]·x + W[i]·mean_input`
+  thay vì chỉ `W_quant[i]·x` — bias phải pruned-only (doc `sparse.rs:14-21` nói
+  pruned-only nhưng code add unconditional). Fix: `row_to_expert` + pruned-only dispatch.
 
 ---
 

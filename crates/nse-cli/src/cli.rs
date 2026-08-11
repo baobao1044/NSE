@@ -39,7 +39,9 @@ use nse_train::{
     HopfieldConfig, HopfieldTrainer, LshSparseConfig, LshSparseTrainer, SgdConfig, SgdTrainer,
     Trainer,
 };
-use nse_zstm::{transmute, save_transmuted, load_transmuted, QuantSchemeConfig, TransmuteConfig};
+use nse_zstm::{
+    load_transmuted, save_transmuted, transmute, QuantSchemeConfig, TransmuteConfig,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "nse", about = "Neuro-Sparse Engine POC CLI")]
@@ -239,6 +241,21 @@ enum Cmd {
         /// `8` → 256 centroids per sub-codebook (plan default).
         #[arg(long, default_value_t = 8)]
         pq_nbits: usize,
+        /// Bias application policy:
+        /// "mean" (default, `B[i] = W[i]·mean_input`, pruned-only) or
+        /// "adaptive" (per-token bias via an activation VQ codebook — Phase
+        /// 8 / M9, "PQ là foundation cho cả 2").
+        #[arg(long, default_value = "mean")]
+        bias_mode: String,
+        /// Calibration corpus for the bias + activation codebook (only used
+        /// with `--bias-mode adaptive`). When omitted, the `--corpus` is
+        /// used for calibration too (the M8 behavior).
+        #[arg(long)]
+        calibration_corpus: Option<PathBuf>,
+        /// Activation VQ codebook bits (only used with `--bias-mode
+        /// adaptive`). `8` → 256 centroids in input space (default).
+        #[arg(long, default_value_t = 8)]
+        bias_codebook_bits: usize,
     },
     /// Evaluate sparse PPL of a transmuted model.
     EvalSparse {
@@ -489,7 +506,7 @@ pub fn run() -> Result<()> {
             println!("PPL (dense, forward={forward}): {:.4}", ppl);
             Ok(())
         }
-        Cmd::Transmute { corpus, model, out, outlier_fraction, quant, pq_subvectors, pq_nbits } => {
+        Cmd::Transmute { corpus, model, out, outlier_fraction, quant, pq_subvectors, pq_nbits, bias_mode, calibration_corpus, bias_codebook_bits } => {
             let corpus_bytes = std::fs::read(&corpus)?;
             let lm = nse_models::loader::load_toy_lm(&model)?;
             let quant_scheme = match quant.as_str() {
@@ -512,6 +529,33 @@ pub fn run() -> Result<()> {
                     anyhow::bail!("unknown --quant value '{other}': expected 'ternary' or 'pq'");
                 }
             };
+            let bias_mode_cfg = match bias_mode.as_str() {
+                "mean" => {
+                    eprintln!("Bias mode: mean (B[i] = W[i]·mean_input, pruned-only)");
+                    nse_zstm::BiasMode::Mean
+                }
+                "adaptive" => {
+                    eprintln!(
+                        "Bias mode: adaptive (per-token VQ codebook, {bias_codebook_bits}-bit)"
+                    );
+                    nse_zstm::BiasMode::Adaptive {
+                        nbits: bias_codebook_bits,
+                        iters: 20,
+                        seed: 7,
+                    }
+                }
+                other => {
+                    anyhow::bail!("unknown --bias-mode value '{other}': expected 'mean' or 'adaptive'");
+                }
+            };
+            // Calibration corpus: explicit flag, else fall back to --corpus.
+            let cal_bytes = match &calibration_corpus {
+                Some(p) => {
+                    eprintln!("Calibration corpus: {}", p.display());
+                    Some(std::fs::read(p)?)
+                }
+                None => None,
+            };
             let cfg = TransmuteConfig {
                 outlier: nse_zstm::outlier::OutlierConfig { fraction: outlier_fraction },
                 cluster: nse_zstm::cluster::ClusterConfig {
@@ -520,9 +564,10 @@ pub fn run() -> Result<()> {
                     seed: 7,
                 },
                 quant: quant_scheme,
+                bias_mode: bias_mode_cfg,
             };
             eprintln!("Transmuting dense model -> sparse NSE format");
-            let tm = transmute(&lm, Some(&corpus_bytes), &cfg)?;
+            let tm = transmute(&lm, Some(&corpus_bytes), cal_bytes.as_deref(), &cfg)?;
             save_transmuted(&tm, &out)?;
             eprintln!("Saved transmuted model to {}", out.display());
             Ok(())

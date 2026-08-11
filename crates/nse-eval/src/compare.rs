@@ -133,7 +133,7 @@ mod tests {
             ff_dim: 32,
         };
         let lm = ToyLm::init_random(cfg, 5);
-        let tm = transmute(&lm, Some(corpus), &TransmuteConfig::poc()).unwrap();
+        let tm = transmute(&lm, Some(corpus), None, &TransmuteConfig::poc()).unwrap();
         let report = compare(&lm, &tm, corpus, 16, Activation::All);
         let s = report.pretty();
         assert!(s.contains("PPL dense"));
@@ -162,7 +162,7 @@ mod tests {
             ff_dim: 32,
         };
         let lm = ToyLm::init_random(cfg, 5);
-        let tm = transmute(&lm, Some(corpus), &TransmuteConfig::poc()).unwrap();
+        let tm = transmute(&lm, Some(corpus), None, &TransmuteConfig::poc()).unwrap();
         let report = compare_composite(
             &lm,
             &tm,
@@ -241,8 +241,8 @@ mod tests {
         trainer.train(&mut lm, corpus).unwrap();
 
         // Transmute two ways: ternary (baseline) and PQ (Phase 7).
-        let tm_tern = transmute(&lm, Some(corpus), &TransmuteConfig::poc()).unwrap();
-        let tm_pq = transmute(&lm, Some(corpus), &TransmuteConfig::pq()).unwrap();
+        let tm_tern = transmute(&lm, Some(corpus), None, &TransmuteConfig::poc()).unwrap();
+        let tm_pq = transmute(&lm, Some(corpus), None, &TransmuteConfig::pq()).unwrap();
 
         let report_tern = compare(&lm, &tm_tern, corpus, 16, Activation::All);
         let report_pq = compare(&lm, &tm_pq, corpus, 16, Activation::All);
@@ -277,6 +277,96 @@ mod tests {
             );
         } else {
             eprintln!("  -> aspirational bar MET (PQ reduced degradation >30%)");
+        }
+    }
+
+    /// Phase 8 / M9 headline: adaptive bias (activation VQ codebook) should
+    /// reduce sparse PPL degradation vs mean-bias on **threshold mode** (where
+    /// pruning happens, so pruned rows get the per-token adaptive bias instead
+    /// of the corpus mean). Trains a dim=64 model with SGD, transmutes two
+    /// ways (mean-bias / adaptive), and compares PPL under threshold routing
+    /// (ratio=0.5, max_k=8).
+    ///
+    /// **Honest bar**: the floor asserts adaptive PPL is finite and not
+    /// catastrophically worse than mean-bias (`adaptive < mean * 1.3`). The
+    /// *aspirational* bar (`adaptive < mean * 0.95`, i.e. >5% improvement) is
+    /// logged. On route_all the adaptive path is inert (no pruned rows), so
+    /// the test uses threshold mode where adaptive can help.
+    #[test]
+    fn adaptive_bias_lower_degradation() {
+        use nse_train::{SgdConfig, SgdTrainer, Trainer};
+
+        let corpus = b"to be or not to be that is the question whether tis nobler \
+                       in the mind to suffer the slings and arrows of outrageous \
+                       fortune or to take arms against a sea of troubles and by \
+                       opposing end them to die to sleep no more and by a sleep \
+                       to say we end the heartache and the thousand natural shocks \
+                       that flesh is heir to tis a consummation devoutly to be wished";
+        let tok = Tokenizer::from_corpus(corpus);
+        let cfg = Config {
+            vocab_size: tok.vocab_size,
+            dim: 64,
+            num_layers: 1,
+            num_heads: 2,
+            max_seq_len: 32,
+            ff_dim: 128,
+        };
+        let mut lm = ToyLm::init_random(cfg, 7);
+
+        // Train with SGD.
+        let mut trainer = SgdTrainer::new(SgdConfig {
+            learning_rate: 0.05,
+            seq_len: 16,
+            epochs: 20,
+            lr_decay: 1.0,
+            log_every: 0,
+            seed: 7,
+        });
+        trainer.max_grad_norm = 1.0;
+        trainer.train(&mut lm, corpus).unwrap();
+
+        // Two transmute configs: PQ + mean-bias (S1 pruned-only fix) vs PQ +
+        // adaptive (S3+S4). Both use PQ quant for a fair weight-quant
+        // comparison; only the bias mode differs.
+        let tm_mean = transmute(&lm, Some(corpus), None, &TransmuteConfig::pq()).unwrap();
+        let tm_adapt = transmute(&lm, Some(corpus), None, &TransmuteConfig::adaptive()).unwrap();
+
+        // Threshold routing — pruned rows get the bias (mean or adaptive).
+        let act = Activation::Threshold { ratio: 0.5, max_k: 8 };
+        let report_mean = compare(&lm, &tm_mean, corpus, 16, act);
+        let report_adapt = compare(&lm, &tm_adapt, corpus, 16, act);
+
+        let ppl_dense = report_mean.ppl_dense;
+        let ppl_mean = report_mean.ppl_sparse;
+        let ppl_adapt = report_adapt.ppl_sparse;
+        let ratio = ppl_adapt / ppl_mean.max(1e-6);
+        let deg_mean = (ppl_mean / ppl_dense - 1.0) * 100.0;
+        let deg_adapt = (ppl_adapt / ppl_dense - 1.0) * 100.0;
+
+        eprintln!(
+            "[adaptive_bias_lower_degradation] dense={ppl_dense:.3} \
+             mean-bias={ppl_mean:.3} (+{deg_mean:.1}%)  \
+             adaptive={ppl_adapt:.3} (+{deg_adapt:.1}%)  \
+             adapt/mean={ratio:.3}  \
+             aspirational_bar=<0.95"
+        );
+
+        // Floor: adaptive must be finite and not catastrophically worse.
+        assert!(ppl_adapt.is_finite(), "adaptive PPL not finite");
+        assert!(
+            ppl_adapt < ppl_mean * 1.3,
+            "adaptive catastrophically worse than mean: adapt={ppl_adapt:.3} mean={ppl_mean:.3}"
+        );
+        // Aspirational: log whether adaptive beats mean-bias by >5%.
+        if ratio >= 0.95 {
+            eprintln!(
+                "  -> aspirational bar NOT met (adaptive did not beat mean-bias >5%); \
+                 VQ 256-level coarse trong 64-dim + ~50 calibration tokens (toy) → adaptive \
+                 advantage may be sub-optimal. Documented honestly per Phase 8 plan. \
+                 PQ M>1 on-the-fly, low-rank bias là Phase 9+."
+            );
+        } else {
+            eprintln!("  -> aspirational bar MET (adaptive beat mean-bias >5%)");
         }
     }
 }
