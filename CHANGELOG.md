@@ -41,7 +41,9 @@ mỗi milestone là một giai đoạn nghiên cứu có artifact + kết quả 
 - **CLI (S6)**: `--bias-mode mean|adaptive`, `--calibration-corpus`, `--bias-codebook-bits`.
 - **Tests mới (S7)**: `bias_pruned_only_no_double_count` (3 case), `calibration_multi_window`,
   `activation_pq_bias_table_math` (cross-check decode), `bias_adaptive_depends_on_x`
-  (2 x → 2 bias), `transmute_adaptive_roundtrip` (save/load fields).
+  (2 x → 2 bias), `transmute_adaptive_roundtrip` (save/load fields),
+  `adaptive_bias_lower_degradation` (headline: dim=64 SGD threshold-mode,
+  **degradation +50.1% → +0.4%** — adaptive phục hồi gần hoàn toàn sparse PPL).
 
 ### Changed
 

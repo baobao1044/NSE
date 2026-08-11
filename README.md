@@ -223,7 +223,7 @@ CLI in 4 chữ số thập phân cho PPL và 2 cho %.)
 | M6 | ✅ | Scaffold AVX2/HNSW + 3 trainer thay thế (FF/Hopfield/LSH-sparse) | AVX2, HNSW, 3 trainer |
 | M7 | ✅ | `CompositeTrainer` (hippocampus+cortex) + sparse Hopfield forward + `eval-composite` 4-path | `CompositeTrainer`, `eval-composite` |
 | M8 | ✅ | PQ codebook thật (per-sub-vector L2 k-means, 8-bit, shared/lớp) + kernel scalar/AVX2 + `--quant pq`; degradation +32.8% → +18.4% (dim=64) | `PqCodebook`, `--quant pq` |
-| M9 | ✅ | Calibration + bias-adaptive: sửa double-count bias (pruned-only) + activation VQ codebook (M=1, 256 centroids) + `--bias-mode adaptive`; per-token bias cho pruned rows | `BiasMode`, `--bias-mode adaptive` |
+| M9 | ✅ | Calibration + bias-adaptive: sửa double-count bias (pruned-only) + activation VQ codebook (M=1, 256 centroids) + `--bias-mode adaptive`; per-token bias cho pruned rows; **threshold-mode degradation +50.1% → +0.4%** (dim=64) | `BiasMode`, `--bias-mode adaptive` |
 
 Tất cả 9 milestone hoàn thành. 56+ test pass trên toàn workspace.
 

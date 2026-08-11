@@ -678,22 +678,44 @@ không dùng (no pruned rows); chỉ S1 fix giúp (no double-count).
 
 #### 5.8.5 Kết quả + trung thực về giới hạn
 
-[Số liệu headline sẽ điền sau khi test end-to-end xong — `adaptive_bias_lower_degradation`
-so sánh mean-bias vs adaptive trên dim=64 SGD threshold-mode.]
+**Headline** (dim=64 SGD, threshold mode ratio=0.5 max_k=8):
+
+| Path | PPL | Degradation vs dense |
+|------|-----|----------------------|
+| Dense (SGD 20 epoch) | 13.531 | — |
+| Sparse PQ + mean-bias (threshold) | 20.317 | **+50.1%** |
+| Sparse PQ + adaptive (threshold) | 13.582 | **+0.4%** |
+
+Adaptive **giảm degradation từ +50.1% → +0.4%** (adapt/mean=0.668) — gần như
+phục hồi hoàn toàn sparse PPL về dense. Aspirational bar >5% improvement MET
+(thực tế 33%). **Bar <15% vượt xa** (+0.4% << 15%).
+
+Giải thích: trong threshold mode, pruned rows nhận bias thay vì computation.
+Mean-bias dùng `W[i]·mean_input` (1 giá trị cố định cho mọi token) → sai lệch lớn
+khi activation thật ≠ mean. Adaptive encode token's `x` → code `c` → lookup
+`bias_table[c][i] = W_quant[i]·centroid[c]` → bias per-token, gần với `W[i]·x`
+hơn. VQ 256 centroids đủ phân biệt các token trên toy corpus.
+
+Lưu ý: threshold mode (ratio=0.5, max_k=8) prune nhiều experts (8/total) →
+nhiều pruned rows → adaptive giúp nhiều. Route_all (no pruning) → adaptive
+không dùng (no pruned rows); chỉ S1 fix giúp (no double-count).
 
 Giới hạn trung thực:
 1. **S1 fix có thể không giúp route_all nhiều**: double-count bias
    `W[i]·mean_input` là constant; layernorm kế tiếp remove mean → có thể wash
    out. Đo thật, document.
 2. **VQ M=1 256-level coarse**: 64-dim space, 256 centroids, ~50 calibration
-   tokens (toy) → nhiều empty clusters. PQ M>1 on-the-fly (Phase 9) nếu VQ
-   không đủ.
+   tokens (toy) → nhiều empty clusters. Trên toy này adaptive thắng mạnh
+   (+50.1%→+0.4%) nhưng trên model lớn hơn (dim ≥ 128, calibration set lớn)
+   VQ có thể cần PQ M>1 on-the-fly (Phase 9) để đủ resolution.
 3. **bias_table storage**: 256×out_dim×4 bytes/matmul. Toy OK; model thật
-   phá L3. Production cần low-rank hoặc shared (Phase 9).
+   (out_dim=3072) ~ 3MB × 4 × 12 = 144MB — phá L3. Production cần low-rank
+   hoặc shared (Phase 9).
 4. **Adaptive chỉ giúp threshold mode**: route_all (no pruning) → adaptive
    không dùng. S1 fix giúp route_all.
-5. **Bar <15% không đảm bảo**: S1 + adaptive có thể đưa xuống <15% hoặc
-   không — toy model + ít calibration data. Tài liệu hóa + tiếp tục (Phase 9).
+5. **+0.4% trên toy có thể optimistisch**: threshold mode prune nhiều trên toy
+   (n_experts nhỏ, max_k=8); trên model lớn hơn với routing tinh vi hơn, tỷ lệ
+   pruned rows có thể khác. Tài liệu hóa + verify trên scale lớn hơn (Phase 9).
 
 ---
 
